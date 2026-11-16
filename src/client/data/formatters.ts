@@ -99,4 +99,4 @@ export function formatFolder(folder: string): string {
 }
 
 /** The one caption every timing surface carries: untimed rows show N/A, not zero. */
-export const TIMING_NOTE = "TTFT and latency for older messages show N/A: timing captured since install";
+export const TIMING_NOTE = "TTFT shows N/A for messages sent before pi-stats was loaded: timing captured since install";
