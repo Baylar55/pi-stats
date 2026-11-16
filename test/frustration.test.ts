@@ -149,7 +149,7 @@ describe("frustration dashboard", () => {
 		expect(stats.judgeAvailable).toBe(false);
 	});
 
-	it("merges the same model across providers and orders rows by first use", async () => {
+	it("keeps one row per provider and model, ordered by first use", async () => {
 		await initDb();
 		const t = Date.now() - 60_000;
 		insertUserMessageStats([
@@ -161,10 +161,11 @@ describe("frustration dashboard", () => {
 		const { byModel } = await getFrustrationDashboardStats("all");
 
 		expect(byModel.map(row => [row.key, row.messages, row.firstSeen])).toEqual([
-			["weird-model", 1, t],
-			["gpt-x", 2, t + 1],
+			["custom/weird-model", 1, t],
+			["openai/gpt-x", 1, t + 1],
+			["openai-codex/gpt-x", 1, t + 2],
 		]);
-		expect(byModel[1]).toMatchObject({ label: "gpt-x", modelClass: "unknown", revision: null, models: ["gpt-x"] });
+		expect(byModel[1]).toMatchObject({ label: "gpt-x", modelClass: "openai", family: "gpt-x", revision: null });
 	});
 
 	it("quotes and runs the judge once per unique unjudged prose, streaming verdicts into the dashboard", async () => {

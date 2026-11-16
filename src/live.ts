@@ -3,21 +3,24 @@
  * refresh, and a status stream the client subscribes to (`/api/events`).
  *
  * The dashboard never waits for ingest. {@link StatsLive.start} kicks a full
- * sync in the background and watches the sessions directory; changed
- * transcripts are re-synced (only those files) shortly after they are written.
+ * sync in the background and watches every session root; changed transcripts
+ * are re-synced (only those files) shortly after they are written.
  * Every batch that changes stored rows bumps {@link LiveStatus.version}
  * (throttled), so open pages refetch and fill in while parsing is still
  * running; syncs that change nothing leave the version alone.
+ *
+ * Nothing here holds the host process open: the dashboard also runs inside
+ * pi, which must be able to exit with a sync or a timer still pending.
  */
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { getSessionsDir, logger } from "@oh-my-pi/pi-utils";
 import { syncAllSessions } from "./aggregator";
+import { getSessionRoots } from "./config";
 import { getDataVersion, initDb } from "./db";
-import { isCompressScratchPath } from "./parser";
 import { getRollupStatus, refreshRollups } from "./rollup";
 import type { LiveStatus, LiveSyncStatus } from "./shared-types";
+import { logger } from "./util";
 
 /** Wait this long after the last transcript write before syncing it. */
 const WATCH_DEBOUNCE_MS = 800;
@@ -30,7 +33,7 @@ const VERSION_THROTTLE_MS = 1000;
  * otherwise spend most of its time serving refetches; the held-back bump lands when the sync ends.
  */
 const SYNCING_VERSION_THROTTLE_MS = 15_000;
-/** Delay before retrying a failed sync (typically a lock held by another omp process). */
+/** Delay before retrying a failed sync (typically a lock held by another pi process). */
 const SYNC_RETRY_MS = 10_000;
 /** Minimum spacing of progress-only status events. */
 const PROGRESS_THROTTLE_MS = 150;
@@ -50,7 +53,10 @@ export class StatsLive {
 	#dataVersion: number | null = null;
 
 	#started = false;
-	#watcher: fs.FSWatcher | null = null;
+	/** One recursive watcher per session root that exists. */
+	#watchers = new Map<string, fs.FSWatcher>();
+	/** Transcripts written since the last debounced sync. */
+	#written = new Set<string>();
 	#fullSyncTimer: NodeJS.Timeout | null = null;
 	#debounceTimer: NodeJS.Timeout | null = null;
 	#versionTimer: NodeJS.Timeout | null = null;
@@ -74,20 +80,20 @@ export class StatsLive {
 		return () => this.#listeners.delete(listener);
 	}
 
-	/** Begin background ingest: an immediate full sync, the transcript watcher, and periodic resyncs. Idempotent. */
+	/** Begin background ingest: an immediate full sync, the transcript watchers, and periodic resyncs. Idempotent. */
 	start(): void {
 		if (this.#started) return;
 		this.#started = true;
-		this.#watch();
 		this.#fullSyncTimer = setInterval(() => this.requestSync(), FULL_SYNC_INTERVAL_MS);
-		this.#fullSyncTimer.unref?.();
+		this.#fullSyncTimer.unref();
 		this.requestSync();
 	}
 
 	stop(): void {
 		this.#started = false;
-		this.#watcher?.close();
-		this.#watcher = null;
+		for (const watcher of this.#watchers.values()) watcher.close();
+		this.#watchers.clear();
+		this.#written.clear();
 		clearInterval(this.#fullSyncTimer ?? undefined);
 		for (const timer of [this.#debounceTimer, this.#versionTimer, this.#progressTimer, this.#retryTimer]) {
 			clearTimeout(timer ?? undefined);
@@ -101,12 +107,23 @@ export class StatsLive {
 	 * while a sync runs coalesce into one follow-up run.
 	 */
 	requestSync(files?: readonly string[]): void {
-		if (!files) this.#queued = "all";
-		else if (this.#queued !== "all") {
+		if (!files) {
+			this.#queued = "all";
+			// A root can appear after start (first session in a new dir, a root the host adds later).
+			if (this.#started) this.#watch();
+		} else if (this.#queued !== "all") {
 			this.#queued ??= new Set();
 			for (const file of files) this.#queued.add(file);
 		}
 		void this.#drain();
+	}
+
+	/**
+	 * Rows changed outside a sync (a live request timing landed): refresh the
+	 * rollups and let open pages refetch. A no-op while no dashboard is live.
+	 */
+	dataChanged(): void {
+		if (this.#started) this.#changed();
 	}
 
 	async #drain(): Promise<void> {
@@ -162,7 +179,7 @@ export class StatsLive {
 		} catch (error) {
 			logger.warn("Stats live sync failed", { error: String(error) });
 			this.#sync = { ...this.#sync, phase: "error", error: error instanceof Error ? error.message : String(error) };
-			// Usually lock contention with another omp process writing the same
+			// Usually lock contention with another pi process writing the same
 			// database; committed batches are kept, so a retry resumes where it stopped.
 			if (this.#started) {
 				clearTimeout(this.#retryTimer ?? undefined);
@@ -170,6 +187,7 @@ export class StatsLive {
 					this.#retryTimer = null;
 					this.requestSync(files);
 				}, SYNC_RETRY_MS);
+				this.#retryTimer.unref();
 			}
 		}
 		// Another process may have ingested too; its commits move SQLite's data_version.
@@ -200,6 +218,7 @@ export class StatsLive {
 		const spacing = this.#sync.phase === "syncing" ? SYNCING_VERSION_THROTTLE_MS : VERSION_THROTTLE_MS;
 		const wait = Math.max(0, this.#lastVersionAt + spacing - Date.now());
 		this.#versionTimer = setTimeout(() => this.#advanceVersion(), wait);
+		this.#versionTimer.unref();
 	}
 
 	/** Bump the data version now, cancelling a pending throttled bump. */
@@ -239,29 +258,35 @@ export class StatsLive {
 		this.#emit();
 	}
 
+	/** Watch every session root not watched yet. A root that does not exist is retried at the next full sync. */
 	#watch(): void {
-		const root = getSessionsDir();
-		const pending = new Set<string>();
-		try {
-			this.#watcher = fs.watch(root, { recursive: true }, (_event, filename) => {
-				if (!filename?.endsWith(".jsonl") || isCompressScratchPath(filename)) return;
-				pending.add(path.join(root, filename));
-				clearTimeout(this.#debounceTimer ?? undefined);
-				this.#debounceTimer = setTimeout(() => {
-					this.#debounceTimer = null;
-					const files = [...pending];
-					pending.clear();
-					this.requestSync(files);
-				}, WATCH_DEBOUNCE_MS);
-			});
-			this.#watcher.on("error", error => {
-				logger.warn("Stats session watcher failed; relying on periodic sync", { error: String(error) });
-				this.#watcher?.close();
-				this.#watcher = null;
-			});
-		} catch (error) {
-			// No sessions dir yet, or recursive watch unsupported: periodic full syncs cover it.
-			logger.debug("Stats session watcher unavailable", { root, error: String(error) });
+		for (const root of getSessionRoots()) {
+			if (this.#watchers.has(root)) continue;
+			try {
+				const watcher = fs.watch(root, { recursive: true }, (_event, filename) => {
+					if (!filename?.endsWith(".jsonl")) return;
+					// Resolved like the sync's own listing, so both name a transcript the same way.
+					this.#written.add(path.resolve(root, filename));
+					clearTimeout(this.#debounceTimer ?? undefined);
+					this.#debounceTimer = setTimeout(() => {
+						this.#debounceTimer = null;
+						const files = [...this.#written];
+						this.#written.clear();
+						this.requestSync(files);
+					}, WATCH_DEBOUNCE_MS);
+					this.#debounceTimer.unref();
+				});
+				watcher.unref();
+				watcher.on("error", error => {
+					logger.warn("Stats session watcher failed; relying on periodic sync", { root, error: String(error) });
+					watcher.close();
+					this.#watchers.delete(root);
+				});
+				this.#watchers.set(root, watcher);
+			} catch (error) {
+				// No such dir yet, or recursive watch unsupported: periodic full syncs cover it.
+				logger.debug("Stats session watcher unavailable", { root, error: String(error) });
+			}
 		}
 	}
 
@@ -271,6 +296,7 @@ export class StatsLive {
 			this.#progressTimer = null;
 			this.#emit();
 		}, PROGRESS_THROTTLE_MS);
+		this.#progressTimer.unref();
 	}
 
 	#emit(): void {

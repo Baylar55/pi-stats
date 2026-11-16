@@ -1,6 +1,7 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import * as http from "node:http";
+import * as net from "node:net";
 import { networkInterfaces } from "node:os";
-import { connect, type Subprocess } from "bun";
+import { afterEach, describe, expect, it } from "vitest";
 import {
 	STATS_DASHBOARD_HEADER,
 	STATS_DASHBOARD_HOSTNAME,
@@ -8,28 +9,30 @@ import {
 	STATS_DASHBOARD_SECURITY_VERSION,
 } from "../src/port-conflict";
 import { startServer } from "../src/server";
+import { sleep } from "../src/util";
 import { installStatsTestIsolation } from "./helpers/temp-agent";
 
 installStatsTestIsolation("@pi-stats-port-conflict-");
 
 /**
- * Directly probe a TCP endpoint, bypassing any configured HTTP proxy so the
- * loopback-only bind is asserted against the real listener rather than a proxy
- * response. Resolves true when the connection is accepted, false when refused or
- * unanswered: a firewall in stealth mode drops the SYN to a closed port instead of
- * refusing it, and an unanswered SYN raises no event to await or fake clock to
- * advance, so a real one-second bound keeps the probe inside the test timeout.
+ * Directly probe a TCP endpoint. Resolves true when the connection is accepted,
+ * false when refused or unanswered: a firewall in stealth mode drops the SYN to
+ * a closed port instead of refusing it, so a real one-second bound keeps the
+ * probe inside the test timeout.
  */
-async function tcpConnects(hostname: string, port: number): Promise<boolean> {
-	const attempt = connect({ hostname, port, socket: { data() {}, open() {}, close() {}, error() {} } }).then(
-		socket => {
-			socket.end();
-			return true;
-		},
-		() => false,
-	);
-	return Promise.race([attempt, Bun.sleep(1_000).then(() => false)]);
+function tcpConnects(hostname: string, port: number): Promise<boolean> {
+	const { promise, resolve } = Promise.withResolvers<boolean>();
+	const socket = net.connect({ host: hostname, port, timeout: 1_000 });
+	const settle = (connected: boolean) => {
+		socket.destroy();
+		resolve(connected);
+	};
+	socket.once("connect", () => settle(true));
+	socket.once("error", () => settle(false));
+	socket.once("timeout", () => settle(false));
+	return promise;
 }
+
 function getNonLoopbackHostname(): string | undefined {
 	const interfaces = networkInterfaces();
 	for (const name in interfaces) {
@@ -40,62 +43,48 @@ function getNonLoopbackHostname(): string | undefined {
 	return undefined;
 }
 
-const holderProcesses: Array<Subprocess<"ignore", "pipe", "pipe">> = [];
+const holders: http.Server[] = [];
 
-async function startBunHolder(responseExpr: string, options?: { hostname?: string; statsOwned?: boolean }) {
-	const hostname = options?.hostname ?? STATS_DASHBOARD_HOSTNAME;
-	const reservation = Bun.serve({
-		port: 0,
-		hostname: STATS_DASHBOARD_HOSTNAME,
-		fetch: () => new Response("reserved"),
+/** Some other program holding a port: answers every request through `respond`. */
+async function startHolder(respond: (res: http.ServerResponse) => void): Promise<{ port: number; requests: () => number }> {
+	let requests = 0;
+	const server = http.createServer((_req, res) => {
+		requests++;
+		respond(res);
 	});
-	const port = reservation.port;
-	reservation.stop(true);
+	holders.push(server);
+	const { promise, resolve } = Promise.withResolvers<void>();
+	server.listen(0, STATS_DASHBOARD_HOSTNAME, resolve);
+	await promise;
+	const address = server.address();
+	if (!address || typeof address !== "object") throw new Error("holder did not bind");
+	return { port: address.port, requests: () => requests };
+}
 
-	const source = `Bun.serve({ port: ${port}, hostname: "${hostname}", fetch: () => ${responseExpr} }); process.stdout.write("ready"); await Promise.withResolvers().promise;`;
-	const args = [process.execPath, "-e", source];
-	if (options?.statsOwned) args.push("omp-stats");
-	const child = Bun.spawn(args, {
-		// The isolated environment, passed explicitly: a child must never resolve the user's stats database.
-		env: { ...process.env },
-		stdin: "ignore",
-		stdout: "pipe",
-		stderr: "pipe",
-	});
-	holderProcesses.push(child);
-
-	const reader = child.stdout.getReader();
-	const ready = await reader.read();
-	reader.releaseLock();
-	if (!ready.done && new TextDecoder().decode(ready.value) === "ready") {
-		return { child, port };
-	}
-
-	await child.exited;
-	const stderr = await new Response(child.stderr).text();
-	throw new Error(`Holder failed to listen on port ${port}: ${stderr}`);
+function dashboardHeaders(version = STATS_DASHBOARD_SECURITY_VERSION, hostname = STATS_DASHBOARD_HOSTNAME) {
+	return { "content-type": "application/json", [STATS_DASHBOARD_HEADER]: version, [STATS_DASHBOARD_HOSTNAME_HEADER]: hostname };
 }
 
 /** Assert that a current, same-origin-only dashboard answers on `port`. */
 async function expectCurrentDashboard(port: number): Promise<void> {
 	const response = await fetch(`http://${STATS_DASHBOARD_HOSTNAME}:${port}/api/stats/models`);
+	expect(response.status).toBe(200);
 	expect(response.headers.get(STATS_DASHBOARD_HEADER)).toBe(STATS_DASHBOARD_SECURITY_VERSION);
 	expect(response.headers.get("Access-Control-Allow-Origin")).toBeNull();
 	await response.body?.cancel();
 }
 
-afterEach(async () => {
-	for (const child of holderProcesses) {
-		child.kill();
-		await child.exited;
+afterEach(() => {
+	for (const holder of holders) {
+		holder.close();
+		holder.closeAllConnections();
 	}
-	holderProcesses.length = 0;
+	holders.length = 0;
 });
 
 describe("startServer access", () => {
 	it("only serves loopback requests without cross-origin access", async () => {
 		const server = await startServer(0);
-
 		try {
 			expect(server.hostname).toBe(STATS_DASHBOARD_HOSTNAME);
 			const response = await fetch(`http://${server.hostname}:${server.port}/api/stats/models`);
@@ -116,16 +105,12 @@ describe("startServer access", () => {
 	it("serves non-loopback requests only when explicitly requested", async () => {
 		const nonLoopbackHostname = getNonLoopbackHostname();
 		if (!nonLoopbackHostname) return;
-
 		const server = await startServer(0, "0.0.0.0");
-
 		try {
 			expect(server.hostname).toBe("0.0.0.0");
 			expect(await tcpConnects(nonLoopbackHostname, server.port)).toBe(true);
-
 			const response = await fetch(`http://${STATS_DASHBOARD_HOSTNAME}:${server.port}/api/stats/models`);
 			expect(response.status).toBe(200);
-			expect(response.headers.get(STATS_DASHBOARD_HEADER)).toBe(STATS_DASHBOARD_SECURITY_VERSION);
 			expect(response.headers.get(STATS_DASHBOARD_HOSTNAME_HEADER)).toBe("0.0.0.0");
 			expect(response.headers.get("Access-Control-Allow-Origin")).toBeNull();
 			await response.body?.cancel();
@@ -133,20 +118,25 @@ describe("startServer access", () => {
 			server.stop();
 		}
 	});
+
+	it("stops answering once stopped and frees the port", async () => {
+		const server = await startServer(0);
+		server.stop();
+		server.stop();
+
+		expect(await tcpConnects(server.hostname, server.port)).toBe(false);
+	});
 });
 
 describe("startServer port conflicts", () => {
 	it("returns the live in-process handle when started twice on the same port", async () => {
-		// Reserve an ephemeral port, then start on it explicitly so the memo applies.
-		const reservation = Bun.serve({ port: 0, hostname: STATS_DASHBOARD_HOSTNAME, fetch: () => new Response("") });
-		const port = reservation.port;
-		reservation.stop(true);
-
-		const first = await startServer(port);
+		const reserved = await startHolder(res => res.end());
+		holders.pop()?.close();
+		const first = await startServer(reserved.port);
 		try {
 			// Regression: the second start used to probe our own port and could
 			// dead-end in "Port X is held by the current process".
-			const second = await startServer(port);
+			const second = await startServer(reserved.port);
 			expect(second.port).toBe(first.port);
 			expect(second).toBe(first);
 		} finally {
@@ -154,118 +144,71 @@ describe("startServer port conflicts", () => {
 		}
 	});
 
-	it("reuses a live stats dashboard identified by its header", async () => {
-		const existing = Bun.serve({
-			port: 0,
-			hostname: STATS_DASHBOARD_HOSTNAME,
-			fetch: request =>
-				new URL(request.url).pathname === "/api/stats/models"
-					? Response.json([], {
-							headers: {
-								[STATS_DASHBOARD_HEADER]: STATS_DASHBOARD_SECURITY_VERSION,
-								[STATS_DASHBOARD_HOSTNAME_HEADER]: STATS_DASHBOARD_HOSTNAME,
-							},
-						})
-					: new Response("dashboard"),
-		});
+	it("reuses a live stats dashboard identified by its headers", async () => {
+		const existing = await startHolder(res => res.writeHead(200, dashboardHeaders()).end("[]"));
 
-		try {
-			const server = await startServer(existing.port);
-			expect(server.port).toBe(existing.port);
-			expect(server.reused).toBe(true);
-			server.stop();
+		const server = await startServer(existing.port);
 
-			// The existing dashboard is untouched: it still answers on the port.
-			const response = await fetch(`http://${STATS_DASHBOARD_HOSTNAME}:${existing.port}/api/stats/models`);
-			expect(response.status).toBe(200);
-			expect(response.headers.get(STATS_DASHBOARD_HEADER)).toBe(STATS_DASHBOARD_SECURITY_VERSION);
-			await response.body?.cancel();
-		} finally {
-			existing.stop(true);
-		}
+		expect(server.port).toBe(existing.port);
+		expect(server.reused).toBe(true);
+		server.stop();
+		// The existing dashboard is untouched: it still answers on the port.
+		await expectCurrentDashboard(existing.port);
 	});
 
 	it("reuses a live dashboard that answers slowly while it ingests", async () => {
-		// Regression: a dashboard stalled by ingest missed the probe deadline and
-		// `/stats` failed with "not identifiable as an omp stats dashboard". The
-		// holder is a separate process probed over real sockets, so its stall has
-		// to be a real delay; fake timers here cannot slow another process down.
-		const headers = `{ "${STATS_DASHBOARD_HEADER}": "${STATS_DASHBOARD_SECURITY_VERSION}", "${STATS_DASHBOARD_HOSTNAME_HEADER}": "${STATS_DASHBOARD_HOSTNAME}" }`;
-		const holder = await startBunHolder(`Bun.sleep(1_000).then(() => Response.json([], { headers: ${headers} }))`);
+		// A dashboard stalled by ingest must not be mistaken for a hung listener.
+		const existing = await startHolder(res => {
+			void sleep(1_000).then(() => res.writeHead(200, dashboardHeaders()).end("[]"));
+		});
 
-		const server = await startServer(holder.port);
-		expect(server.port).toBe(holder.port);
-		expect(holder.child.exitCode).toBeNull();
+		const server = await startServer(existing.port);
+
+		expect(server).toMatchObject({ port: existing.port, reused: true });
 	});
 
 	for (const fixture of [
-		{
-			name: "reclaims a version 1 dashboard without command identity",
-			response: `Response.json([], { headers: { "${STATS_DASHBOARD_HEADER}": "1", "Access-Control-Allow-Origin": "*" } })`,
-			hostname: "0.0.0.0",
-			statsOwned: false,
-		},
-		{
-			name: "reclaims a headerless legacy dashboard",
-			response: "Response.json([])",
-			hostname: STATS_DASHBOARD_HOSTNAME,
-			statsOwned: true,
-		},
+		{ name: "an omp stats dashboard on the shared default port", respond: (res: http.ServerResponse) => res.writeHead(200, { "x-omp-stats-dashboard": "3", "x-omp-stats-hostname": "127.0.0.1" }).end("[]") },
+		{ name: "a dashboard of another version", respond: (res: http.ServerResponse) => res.writeHead(200, dashboardHeaders(String(Number(STATS_DASHBOARD_SECURITY_VERSION) + 1))).end("[]") },
+		{ name: "a dashboard bound to another host", respond: (res: http.ServerResponse) => res.writeHead(200, dashboardHeaders(STATS_DASHBOARD_SECURITY_VERSION, "0.0.0.0")).end("[]") },
+		{ name: "a dashboard look-alike that allows cross-origin reads", respond: (res: http.ServerResponse) => res.writeHead(200, { ...dashboardHeaders(), "Access-Control-Allow-Origin": "*" }).end("[]") },
+		{ name: "a foreign 200 responder", respond: (res: http.ServerResponse) => res.writeHead(200).end('{"app":"spa"}') },
+		{ name: "a foreign listener that fails the probe", respond: (res: http.ServerResponse) => res.writeHead(404).end("foreign") },
+		// Never answering is what a dashboard stalled mid-ingest looks like; it must be left alone.
+		{ name: "a listener that never answers", respond: () => {} },
 	]) {
-		it(fixture.name, async () => {
-			const holder = await startBunHolder(fixture.response, {
-				hostname: fixture.hostname,
-				statsOwned: fixture.statsOwned,
-			});
+		it(`serves on a free port beside ${fixture.name}`, async () => {
+			const holder = await startHolder(fixture.respond);
+
 			const server = await startServer(holder.port);
-
-			try {
-				expect(await holder.child.exited).not.toBe(0);
-				await expectCurrentDashboard(server.port);
-			} finally {
-				server.stop();
-			}
-		});
-	}
-
-	for (const fixture of [
-		{
-			name: "a newer dashboard without command identity",
-			response: `Response.json([], { headers: { "${STATS_DASHBOARD_HEADER}": "${Number(STATS_DASHBOARD_SECURITY_VERSION) + 1}" } })`,
-			statsOwned: false,
-		},
-		{ name: "a foreign 200 responder", response: 'Response.json({ app: "spa" })', statsOwned: false },
-		{
-			name: "an unrelated Bun listener that fails the probe",
-			response: 'new Response("foreign", { status: 404 })',
-			statsOwned: false,
-		},
-		// Never answering is what a dashboard stalled mid-ingest looks like; stopping it would kill a live `omp stats`.
-		{ name: "a stats listener that never answers", response: "Promise.withResolvers().promise", statsOwned: true },
-	]) {
-		it(`serves on an ephemeral port beside ${fixture.name}`, async () => {
-			const holder = await startBunHolder(fixture.response, { statsOwned: fixture.statsOwned });
-			const server = await startServer(holder.port);
-
 			try {
 				expect(server.port).not.toBe(holder.port);
-				expect(holder.child.exitCode).toBeNull();
+				expect(server.reused).toBe(false);
 				await expectCurrentDashboard(server.port);
+				// The holder was probed, never stopped: it still accepts connections.
+				expect(holder.requests()).toBeGreaterThan(0);
+				expect(await tcpConnects(STATS_DASHBOARD_HOSTNAME, holder.port)).toBe(true);
 			} finally {
 				server.stop();
 			}
 		}, 10_000);
 	}
 
-	it("reclaims a confirmed stats listener that fails the probe", async () => {
-		const holder = await startBunHolder('new Response("holder", { status: 404 })', { statsOwned: true });
-		const server = await startServer(holder.port);
+	it("serves on a free port when a non-HTTP program holds the requested one", async () => {
+		const raw = net.createServer(socket => socket.destroy());
+		const { promise, resolve } = Promise.withResolvers<void>();
+		raw.listen(0, STATS_DASHBOARD_HOSTNAME, resolve);
+		await promise;
+		const address = raw.address();
+		if (!address || typeof address !== "object") throw new Error("raw holder did not bind");
 
+		const server = await startServer(address.port);
 		try {
-			expect(server.port).toBe(holder.port);
-			expect(await holder.child.exited).not.toBe(0);
+			expect(server.port).not.toBe(address.port);
+			await expectCurrentDashboard(server.port);
 		} finally {
 			server.stop();
+			raw.close();
 		}
 	});
 });

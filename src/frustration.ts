@@ -133,29 +133,18 @@ export function getFrustrationJobStatus(): FrustrationJobStatus {
 }
 
 /**
- * Merge per-(model, provider) rows into one row per model id, so the same
- * model reached through several providers shares a row; rows sort by first
- * use. omp merges by its catalog's `class/family/revision` identity, which pi
- * has no equivalent of, so the identity fields stay unclassified.
+ * Shape per-(model, provider) rows for the dashboard, sorted by first use.
+ * omp merges provider and spelling variants by its catalog's
+ * `class/family/revision` identity; pi has no such catalog, so the provider
+ * is the class the page filters by and each model is its own family.
  */
 export function mergeFrustrationRows(rows: readonly FrustrationModelRow[]): FrustrationModelStats[] {
-	const merged = new Map<string, FrustrationModelStats>();
-	for (const row of rows) {
-		const existing = merged.get(row.model);
-		if (existing) {
-			existing.messages += row.messages;
-			existing.judged += row.judged;
-			existing.annoyed += row.annoyed;
-			existing.atAssistant += row.atAssistant;
-			existing.angry += row.angry;
-			existing.firstSeen = Math.min(existing.firstSeen, row.firstSeen);
-			continue;
-		}
-		merged.set(row.model, {
-			key: row.model,
+	return rows
+		.map(row => ({
+			key: `${row.provider ?? "unknown"}/${row.model}`,
 			label: row.model,
-			modelClass: "unknown",
-			family: null,
+			modelClass: row.provider ?? "unknown",
+			family: row.model,
 			revision: null,
 			models: [row.model],
 			firstSeen: row.firstSeen,
@@ -164,9 +153,8 @@ export function mergeFrustrationRows(rows: readonly FrustrationModelRow[]): Frus
 			annoyed: row.annoyed,
 			atAssistant: row.atAssistant,
 			angry: row.angry,
-		});
-	}
-	return [...merged.values()].sort((a, b) => a.firstSeen - b.firstSeen);
+		}))
+		.sort((a, b) => a.firstSeen - b.firstSeen);
 }
 
 /** Payload of `GET /api/stats/frustration`. */

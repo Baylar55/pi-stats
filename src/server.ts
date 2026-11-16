@@ -1,8 +1,7 @@
-import type { Dirent } from "node:fs";
-import * as fs from "node:fs/promises";
+import * as fs from "node:fs";
+import * as http from "node:http";
 import * as path from "node:path";
-import { isEnoent, logger } from "@oh-my-pi/pi-utils";
-import { $, type Server } from "bun";
+import { fileURLToPath } from "node:url";
 import {
 	getCostDashboardStats,
 	getDashboardStats,
@@ -10,16 +9,14 @@ import {
 	getModelDashboardStats,
 	getOverviewStats,
 	getProviderDashboardStats,
-	getProviderWindowStats,
 	getRecentErrors,
 	getRecentRequests,
 	getRequestDetails,
 	getTimeRangeConfig,
 	getToolDashboardStats,
 } from "./aggregator";
+import { isLoopbackHost } from "./command";
 import { initDb } from "./db";
-import { decodeEmbeddedClientArchive, hasEmbeddedClientArchive } from "./embedded-client";
-import embeddedClientArchiveTxt from "./embedded-client.generated.txt";
 import {
 	cancelFrustrationRun,
 	estimateFrustrationRun,
@@ -28,7 +25,6 @@ import {
 	setStatsJudgeProvider,
 	startFrustrationRun,
 } from "./frustration";
-import { getGainDashboardStats } from "./gain-aggregator";
 import { statsLive } from "./live";
 import {
 	prepareStatsPort,
@@ -39,7 +35,6 @@ import {
 	STATS_DASHBOARD_SECURITY_VERSION,
 } from "./port-conflict";
 import { getStatsByModel, getTimeSeries } from "./rollup";
-import { buildSpotlightDashboardJson, getSpotlightSessionContext } from "./spotlight-aggregator";
 import {
 	buildSessionTrace,
 	getTraceEntry,
@@ -50,168 +45,60 @@ import {
 	traceFingerprintForEtag,
 	TracePathError,
 } from "./trace";
+import { errorCode, isEnoent, logger } from "./util";
 
-const CLIENT_DIR = path.join(import.meta.dir, "client");
-const STATIC_DIR = path.join(import.meta.dir, "..", "dist", "client");
-const IS_BUN_COMPILED =
-	Boolean(process.env.PI_COMPILED || Bun.env.PI_COMPILED) ||
-	import.meta.url.includes("$bunfs") ||
-	import.meta.url.includes("~BUN") ||
-	import.meta.url.includes("%7EBUN");
-// The prepacked npm bundle (coding-agent dist/cli.js) constant-folds
-// process.env.PI_BUNDLED at build time. Like compiled binaries, it ships no
-// dashboard sources or prebuilt dist/client next to the bundle, so the
-// embedded archive is the only viable asset source.
-const IS_PREBUILT = IS_BUN_COMPILED || Boolean(process.env.PI_BUNDLED || Bun.env.PI_BUNDLED);
-// Sniff the base64 gzip magic instead of decoding: importing this module (every
-// TUI start) must not pay for a multi-megabyte archive nobody may serve.
-const USE_EMBEDDED_CLIENT = hasEmbeddedClientArchive(embeddedClientArchiveTxt) || IS_PREBUILT;
-
-let embeddedClientFilesPromise: Promise<Map<string, Blob>> | null = null;
-
-async function getEmbeddedClientFiles(): Promise<Map<string, Blob>> {
-	if (embeddedClientFilesPromise) return embeddedClientFilesPromise;
-
-	const archive = decodeEmbeddedClientArchive(embeddedClientArchiveTxt);
-	if (!archive) {
-		throw new Error(
-			"Embedded stats client bundle missing. Rebuild the omp binary or npm bundle with embedded stats assets.",
-		);
-	}
-
-	// Keep bundled assets in memory so OS temporary-file cleanup cannot break a live dashboard.
-	embeddedClientFilesPromise = new Bun.Archive(archive).files().then(files => {
-		for (const [name, file] of files) {
-			// Archive entries are untyped blobs; infer MIME types just as disk-backed Bun files do.
-			files.set(name, new File([file], name, { type: Bun.file(name).type }));
-		}
-		return files;
-	});
-
-	return embeddedClientFilesPromise;
-}
-
-async function getLatestMtime(dir: string): Promise<number> {
-	let entries: Dirent[];
-	try {
-		entries = await fs.readdir(dir, { withFileTypes: true });
-	} catch (err) {
-		// Tolerate missing source trees (e.g. installs without the dashboard
-		// sources); the caller falls back to prebuilt assets or a clear build
-		// failure instead of crashing on the scan.
-		if (isEnoent(err)) return 0;
-		throw err;
-	}
-
-	const promises = [];
-	for (const entry of entries) {
-		const fullPath = path.join(dir, entry.name);
-		if (entry.isDirectory()) {
-			promises.push(getLatestMtime(fullPath));
-		} else if (entry.isFile()) {
-			promises.push(fs.stat(fullPath).then(stats => stats.mtimeMs));
-		}
-	}
-
-	let latest = 0;
-	await Promise.allSettled(promises).then(results => {
-		for (const result of results) {
-			if (result.status === "fulfilled") {
-				latest = Math.max(latest, result.value);
-			}
-		}
-	});
-	return latest;
-}
-
-const ensureClientBuild = async () => {
-	if (USE_EMBEDDED_CLIENT) return;
-	const indexPath = path.join(STATIC_DIR, "index.html");
-	const cssPath = path.join(STATIC_DIR, "index.css");
-	const sourceMtime = await getLatestMtime(CLIENT_DIR);
-	let shouldBuild = true;
-	try {
-		const [indexStats, cssStats] = await Promise.all([fs.stat(indexPath), fs.stat(cssPath)]);
-		if (
-			indexStats.isFile() &&
-			cssStats.isFile() &&
-			indexStats.mtimeMs >= sourceMtime &&
-			cssStats.mtimeMs >= sourceMtime
-		) {
-			shouldBuild = false;
-		}
-	} catch {
-		shouldBuild = true;
-	}
-
-	if (!shouldBuild) return;
-
-	await fs.rm(STATIC_DIR, { recursive: true, force: true });
-
-	logger.debug("Building stats client");
-	const packageRoot = path.join(import.meta.dir, "..");
-	const buildResult = await $`bun run build.ts`.cwd(packageRoot).quiet().nothrow();
-	if (buildResult.exitCode !== 0) {
-		const output = buildResult.text().trim();
-		const details = output ? `\n${output}` : "";
-		throw new Error(`Failed to build stats client (exit ${buildResult.exitCode})${details}`);
-	}
+/** The only files the dashboard serves from disk, with their content types. */
+const CLIENT_FILES: Record<string, string> = {
+	"index.html": "text/html; charset=utf-8",
+	"index.js": "text/javascript; charset=utf-8",
+	"index.css": "text/css; charset=utf-8",
+	"favicon.ico": "image/x-icon",
 };
 
 /**
- * Required on every spending/mutating POST. A custom header forces a CORS
- * preflight, which this server never approves, so a hostile page cannot
- * trigger a paid judge run through a cross-site form or `fetch`.
+ * The built client: `./client` beside this module in a built package,
+ * `../dist/client` when running from source. Null until `npm run build` ran.
  */
-const STATS_ACTION_HEADER = "X-Omp-Stats-Action";
+function clientDir(): string | null {
+	for (const relative of ["./client/", "../dist/client/"]) {
+		const dir = fileURLToPath(new URL(relative, import.meta.url));
+		if (fs.existsSync(path.join(dir, "index.html"))) return dir;
+	}
+	return null;
+}
+
+/**
+ * Required on every POST. A custom header forces a CORS preflight, which this
+ * server never approves, so a hostile page cannot trigger a paid judge run (or
+ * a sync, or a close) through a cross-site form or `fetch`.
+ */
+const STATS_ACTION_HEADER = "X-Pi-Stats-Action";
 
 /** What the page's Close calls; unset, the page offers none. */
 let closeHandler: (() => void) | undefined;
 
-/** Longest a Spotlight build serves later requests of its data version: its time range moves with the clock. */
-const SPOTLIGHT_VIEW_TTL_MS = 60_000;
-
-/** Spotlight payloads (JSON) of one live data version by `range\0agent`, with when each was requested. */
-let spotlightViews: { version: number; views: Map<string, { at: number; json: Promise<string> }> } | null = null;
-
-/** Aborted when the last dashboard of this process stops, ending the Spotlight builds still running for it. */
-let spotlightBuilds = new AbortController();
-
-/** Settles when the last queued Spotlight build does: builds run one at a time, as they did on the server's thread. */
-let spotlightQueue: Promise<unknown> = Promise.resolve();
-
-/**
- * The Spotlight dashboard as JSON, built once per data version and view. Every open page refetches on each version
- * bump and a build takes seconds of a worker's CPU and memory, so pages showing the same view share one build and
- * different views wait their turn.
- */
-function spotlightView(range: string | null, agent: string | null): Promise<string> {
-	const version = statsLive().status().version;
-	if (spotlightViews?.version !== version) spotlightViews = { version, views: new Map() };
-	const views = spotlightViews.views;
-	const key = `${range ?? ""}\0${agent ?? ""}`;
-	const cached = views.get(key);
-	if (cached && Date.now() - cached.at < SPOTLIGHT_VIEW_TTL_MS) return cached.json;
-	const { signal } = spotlightBuilds;
-	const json = spotlightQueue.then(() => buildSpotlightDashboardJson(range, agent, signal));
-	spotlightQueue = json.catch(() => {});
-	const entry = { at: Date.now(), json };
-	views.set(key, entry);
-	// A failed build is not reused.
-	json.catch(() => {
-		if (views.get(key) === entry) views.delete(key);
-	});
-	return json;
-}
-
 /**
  * Let the page close the dashboard: while `close` is set, it shows a Close
- * button (and takes Esc and Ctrl+C) that calls it. `omp stats` sets it while
- * Tern shows the page in place of the block it runs in, where the page has no
- * way out of its own; `undefined` takes Close away again.
+ * button (and takes Esc and Ctrl+C) that calls it. For a launcher that shows
+ * the page in place of its own UI; `undefined` takes Close away again. pi
+ * opens the system browser, where closing would leave a dead tab, so the
+ * bundled launchers never set it.
  */
 export function setStatsCloseHandler(close: (() => void) | undefined): void {
 	closeHandler = close;
+}
+
+/** Refuse a POST that could have been sent by another site; null when it may proceed. */
+function rejectForeignPost(req: Request, url: URL): Response | null {
+	if (req.headers.get(STATS_ACTION_HEADER) !== "1") {
+		return Response.json({ error: `${STATS_ACTION_HEADER}: 1 header required` }, { status: 403 });
+	}
+	// Browsers send Origin on every cross-origin POST; the dashboard's own page sends its own origin.
+	const origin = req.headers.get("origin");
+	if (origin !== null && origin !== url.origin) {
+		return Response.json({ error: "cross-origin request refused" }, { status: 403 });
+	}
+	return null;
 }
 
 /**
@@ -220,6 +107,13 @@ export function setStatsCloseHandler(close: (() => void) | undefined): void {
 export async function handleApi(req: Request): Promise<Response> {
 	const url = new URL(req.url);
 	const path = url.pathname;
+
+	if (req.method === "POST") {
+		const refusal = rejectForeignPost(req, url);
+		if (refusal) return refusal;
+	} else if (req.method !== "GET" && req.method !== "HEAD") {
+		return Response.json({ error: "GET or POST required" }, { status: 405 });
+	}
 
 	// Stats reads are DB-only; ingest runs in the background (see `live.ts`).
 	const range = url.searchParams.get("range");
@@ -254,17 +148,14 @@ export async function handleApi(req: Request): Promise<Response> {
 	}
 
 	if (path === "/api/frustration/estimate") {
-		const estimate = await estimateFrustrationRun(range);
+		const estimate = await estimateFrustrationRun(range, url.searchParams.get("model"));
 		return Response.json(estimate);
 	}
 
 	if (path === "/api/frustration/judge" || path === "/api/frustration/cancel") {
 		if (req.method !== "POST") return Response.json({ error: "POST required" }, { status: 405 });
-		if (req.headers.get(STATS_ACTION_HEADER) !== "1") {
-			return Response.json({ error: `${STATS_ACTION_HEADER}: 1 header required` }, { status: 403 });
-		}
 		if (path === "/api/frustration/cancel") return Response.json(cancelFrustrationRun());
-		const result = await startFrustrationRun(range);
+		const result = await startFrustrationRun(range, url.searchParams.get("model"));
 		if (!result.started) return Response.json({ error: result.error }, { status: result.status });
 		return Response.json(result.job, { status: 202 });
 	}
@@ -272,10 +163,6 @@ export async function handleApi(req: Request): Promise<Response> {
 	if (path === "/api/stats/tools") {
 		const stats = await getToolDashboardStats(range);
 		return Response.json(stats);
-	}
-
-	if (path === "/api/stats/provider-windows") {
-		return Response.json(await getProviderWindowStats(range, url.searchParams.get("provider")));
 	}
 
 	if (path === "/api/stats/providers") {
@@ -312,19 +199,15 @@ export async function handleApi(req: Request): Promise<Response> {
 	}
 
 	if (path.startsWith("/api/request/")) {
-		const id = path.split("/").pop();
-		if (!id) return new Response("Bad Request", { status: 400 });
-		const details = await getRequestDetails(parseInt(id, 10));
+		const id = path.slice("/api/request/".length);
+		if (!/^[1-9]\d{0,15}$/.test(id)) return new Response("Bad Request", { status: 400 });
+		const details = await getRequestDetails(Number(id));
 		if (!details) return new Response("Not Found", { status: 404 });
 		return Response.json(details);
 	}
 
 	if (path === "/api/close") {
-		if (req.method === "GET") return Response.json({ closable: closeHandler !== undefined });
-		if (req.method !== "POST") return Response.json({ error: "GET or POST required" }, { status: 405 });
-		if (req.headers.get(STATS_ACTION_HEADER) !== "1") {
-			return Response.json({ error: `${STATS_ACTION_HEADER}: 1 header required` }, { status: 403 });
-		}
+		if (req.method !== "POST") return Response.json({ closable: closeHandler !== undefined });
 		if (!closeHandler) return Response.json({ error: "this dashboard is not closed from its page" }, { status: 404 });
 		closeHandler();
 		return new Response(null, { status: 202 });
@@ -334,25 +217,6 @@ export async function handleApi(req: Request): Promise<Response> {
 		if (req.method !== "POST") return Response.json({ error: "POST required" }, { status: 405 });
 		statsLive().requestSync();
 		return Response.json(statsLive().status(), { status: 202 });
-	}
-
-	if (path === "/api/stats/gain") {
-		const project = url.searchParams.get("project");
-		const stats = await getGainDashboardStats(range, project);
-		return Response.json(stats);
-	}
-	if (path === "/api/stats/spotlight") {
-		return new Response(await spotlightView(range, url.searchParams.get("agent")), {
-			headers: { "content-type": "application/json;charset=utf-8" },
-		});
-	}
-
-	if (path === "/api/stats/spotlight/session") {
-		const file = url.searchParams.get("file");
-		if (!file) return Response.json({ error: "file required" }, { status: 400 });
-		const context = await getSpotlightSessionContext(file);
-		if (!context) return Response.json({ error: "not a Spotlight experiment session" }, { status: 404 });
-		return Response.json(context);
 	}
 
 	if (path === "/api/sessions") {
@@ -371,11 +235,12 @@ export async function handleApi(req: Request): Promise<Response> {
 			// (unchanged) poll returns 304 after stats only; only a changed
 			// tree pays the full re-read/re-parse/rebuild in
 			// buildSessionTrace (itself memoized for non-conditional polls).
-			// The fingerprint covers child transcripts, so a subagent-only
-			// append changes the ETag and never 304s stale.
+			// The fingerprint covers child transcripts and live timings, so
+			// neither a child-only append nor a new timing 304s stale.
 			const clientEtag = req.headers.get("if-none-match");
 			let fingerprint: TraceFingerprint | undefined;
 			if (clientEtag) {
+				await initDb();
 				fingerprint = await traceFingerprintForEtag(file);
 				if (fingerprint !== undefined) {
 					const etag = `"${TRACE_ETAG_VERSION}:${traceEtagForFingerprint(fingerprint)}"`;
@@ -411,30 +276,22 @@ export async function handleApi(req: Request): Promise<Response> {
 }
 
 /**
- * Handle static file requests.
+ * Serve the embedded client. The request path only selects among the fixed
+ * {@link CLIENT_FILES}; it is never joined into a filesystem path, so nothing
+ * else on disk is reachable. Any other path is the SPA's `index.html`.
  */
 async function handleStatic(requestPath: string): Promise<Response> {
-	if (USE_EMBEDDED_CLIENT) {
-		const files = await getEmbeddedClientFiles();
-		const file = files.get(requestPath.slice(1)) ?? files.get("index.html");
-		return file ? new Response(file) : new Response("Not Found", { status: 404 });
+	const dir = clientDir();
+	if (!dir) {
+		return new Response("The stats dashboard client is not built. Run `npm run build` in the pi-stats package.", {
+			status: 503,
+			headers: { "Content-Type": "text/plain; charset=utf-8" },
+		});
 	}
-
-	const filePath = requestPath === "/" ? "/index.html" : requestPath;
-	const fullPath = path.join(STATIC_DIR, filePath);
-
-	const file = Bun.file(fullPath);
-	if (await file.exists()) {
-		return new Response(file);
-	}
-
-	// SPA fallback
-	const index = Bun.file(path.join(STATIC_DIR, "index.html"));
-	if (await index.exists()) {
-		return new Response(index);
-	}
-
-	return new Response("Not Found", { status: 404 });
+	const requested = requestPath.slice(1);
+	const name = Object.hasOwn(CLIENT_FILES, requested) ? requested : "index.html";
+	const body = await fs.promises.readFile(path.join(dir, name));
+	return new Response(body, { headers: { "Content-Type": CLIENT_FILES[name], "Cache-Control": "no-cache" } });
 }
 
 /** Format a dashboard origin, including brackets required by IPv6 literals. */
@@ -443,113 +300,125 @@ export function formatStatsDashboardUrl(hostname: string, port: number): string 
 	return `http://${urlHostname}:${port}`;
 }
 
-function createDashboardServer(port: number, hostname: string): Server<undefined> {
-	const server = Bun.serve({
-		port,
-		hostname,
-		async fetch(req, server) {
-			const url = new URL(req.url);
-			const path = url.pathname;
-
-			// The identity header lets another omp session's reuse probe positively
-			// recognize this dashboard without allowing cross-origin API reads.
-			const dashboardHeaders: Record<string, string> = {
-				[STATS_DASHBOARD_HEADER]: STATS_DASHBOARD_SECURITY_VERSION,
-				[STATS_DASHBOARD_HOSTNAME_HEADER]: hostname,
-			};
-
-			if (req.method === "OPTIONS") {
-				return new Response(null, { headers: dashboardHeaders });
-			}
-
-			if (path === "/api/events") {
-				// Long-lived stream: exempt from the idle timeout.
-				server.timeout(req, 0);
-				return liveEventStream(dashboardHeaders, req.signal);
-			}
-			// A Spotlight build runs on a worker and can outlast the idle timeout, which counts a pending handler.
-			if (path === "/api/stats/spotlight") server.timeout(req, 0);
-
-			try {
-				let response: Response;
-
-				if (path.startsWith("/api/")) {
-					response = await handleApi(req);
-				} else {
-					response = await handleStatic(path);
-				}
-
-				// Add the dashboard identity header to all responses.
-				const headers = new Headers(response.headers);
-				for (const key in dashboardHeaders) {
-					headers.set(key, dashboardHeaders[key]);
-				}
-
-				return new Response(response.body, {
-					status: response.status,
-					headers,
-				});
-			} catch (error) {
-				logger.error("Stats dashboard request failed", { path, error: String(error) });
-				return Response.json(
-					{ error: error instanceof Error ? error.message : "Unknown error" },
-					{ status: 500, headers: dashboardHeaders },
-				);
-			}
-		},
-	});
-	return server;
+/**
+ * Whether a request's `Host` header names this dashboard. A page on another
+ * site can point a DNS name it controls at 127.0.0.1 and read the API through
+ * the browser (DNS rebinding); its requests carry that name as `Host`, which
+ * is refused. A wildcard bind is reachable under names this process cannot
+ * know, so it accepts any.
+ */
+function isAllowedHost(hostHeader: string | undefined, hostname: string, port: number): boolean {
+	if (hostname === "0.0.0.0" || hostname === "::") return true;
+	if (!hostHeader) return false;
+	let requested: URL;
+	try {
+		requested = new URL(`http://${hostHeader}`);
+	} catch {
+		return false;
+	}
+	if ((requested.port || "80") !== String(port)) return false;
+	const name = requested.hostname.toLowerCase();
+	const bound = new URL(formatStatsDashboardUrl(hostname, port)).hostname.toLowerCase();
+	return name === bound || name === "localhost" || name === "127.0.0.1" || name === "[::1]";
 }
 
 /** Keep-alive comment cadence so proxies and the browser keep the stream open. */
 const EVENT_HEARTBEAT_MS = 15_000;
 
 /**
- * Server-sent events of {@link LiveStatus}: the current status immediately,
+ * Server-sent events of `LiveStatus`: the current status immediately,
  * then every change (sync progress, data version bumps, indexing backlog).
  * Disconnects unsubscribe, so ingest winds down once no page is listening.
  */
-function liveEventStream(headers: Record<string, string>, signal: AbortSignal): Response {
+function streamLiveEvents(res: http.ServerResponse): void {
 	const live = statsLive();
 	// Ingest starts when the first page connects, not when the server binds.
 	live.start();
-	const encoder = new TextEncoder();
-	let cleanup = () => {};
-	const stream = new ReadableStream<Uint8Array>({
-		start(controller) {
-			const write = (chunk: string) => {
-				try {
-					controller.enqueue(encoder.encode(chunk));
-				} catch {
-					// Stream already closed: the client left without a cancel.
-					cleanup();
+	res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });
+	// A status frame is a full snapshot: while the socket is backed up the newest one replaces the rest.
+	let blocked = false;
+	let held: string | null = null;
+	const write = (frame: string): void => {
+		if (blocked) {
+			held = frame;
+			return;
+		}
+		blocked = !res.write(`data: ${frame}\n\n`);
+	};
+	res.on("drain", () => {
+		blocked = false;
+		if (held === null) return;
+		const frame = held;
+		held = null;
+		write(frame);
+	});
+	write(JSON.stringify(live.status()));
+	const unsubscribe = live.subscribe((_status, frame) => write(frame));
+	const heartbeat = setInterval(() => {
+		if (!blocked) res.write(": keep-alive\n\n");
+	}, EVENT_HEARTBEAT_MS);
+	heartbeat.unref();
+	res.on("close", () => {
+		unsubscribe();
+		clearInterval(heartbeat);
+	});
+}
+
+async function sendResponse(res: http.ServerResponse, response: Response): Promise<void> {
+	response.headers.forEach((value, key) => res.setHeader(key, value));
+	res.statusCode = response.status;
+	res.end(response.body ? Buffer.from(await response.arrayBuffer()) : undefined);
+}
+
+function createDashboardServer(hostname: string): http.Server {
+	const server = http.createServer((req, res) => {
+		void (async () => {
+			// The identity headers let another pi session's reuse probe positively
+			// recognize this dashboard without allowing cross-origin API reads.
+			res.setHeader(STATS_DASHBOARD_HEADER, STATS_DASHBOARD_SECURITY_VERSION);
+			res.setHeader(STATS_DASHBOARD_HOSTNAME_HEADER, hostname);
+			const address = server.address();
+			const port = address && typeof address === "object" ? address.port : 0;
+			try {
+				if (!isAllowedHost(req.headers.host, hostname, port)) {
+					await sendResponse(res, Response.json({ error: "unrecognized Host header" }, { status: 403 }));
+					return;
 				}
-			};
-			write(`data: ${JSON.stringify(live.status())}\n\n`);
-			const unsubscribe = live.subscribe((_status, frame) => write(`data: ${frame}\n\n`));
-			const heartbeat = setInterval(() => write(": keep-alive\n\n"), EVENT_HEARTBEAT_MS);
-			const onAbort = () => cleanup();
-			cleanup = () => {
-				cleanup = () => {};
-				unsubscribe();
-				clearInterval(heartbeat);
-				signal.removeEventListener("abort", onAbort);
-			};
-			if (signal.aborted) cleanup();
-			else signal.addEventListener("abort", onAbort, { once: true });
-		},
-		cancel() {
-			cleanup();
-		},
+				// No CORS headers are ever sent, so a preflight never approves anything.
+				if (req.method === "OPTIONS") {
+					await sendResponse(res, new Response(null, { status: 204 }));
+					return;
+				}
+				const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
+				if (url.pathname === "/api/events" && req.method === "GET") {
+					streamLiveEvents(res);
+					return;
+				}
+				if (!url.pathname.startsWith("/api/")) {
+					await sendResponse(res, await handleStatic(url.pathname));
+					return;
+				}
+				const headers = new Headers();
+				for (const [name, value] of Object.entries(req.headers)) {
+					if (value !== undefined) headers.set(name, Array.isArray(value) ? value.join(", ") : value);
+				}
+				// No route reads a request body, so none is forwarded.
+				await sendResponse(res, await handleApi(new Request(url, { method: req.method, headers })));
+			} catch (error) {
+				logger.error("Stats dashboard request failed", { url: req.url, error: String(error) });
+				if (res.headersSent) {
+					res.destroy();
+					return;
+				}
+				const message = error instanceof Error ? error.message : "Unknown error";
+				await sendResponse(res, Response.json({ error: message }, { status: 500 })).catch(() => res.destroy());
+			}
+		})();
 	});
-	return new Response(stream, {
-		headers: {
-			...headers,
-			"Content-Type": "text/event-stream",
-			"Cache-Control": "no-cache",
-			Connection: "keep-alive",
-		},
-	});
+	// The dashboard also runs inside pi: neither the listener nor an open page (SSE) may keep that process alive.
+	server.unref();
+	server.on("connection", socket => socket.unref());
+	return server;
 }
 
 /** A dashboard this process started or found; `reused` distinguishes another process's server from one we own. */
@@ -562,7 +431,7 @@ export interface StatsServerHandle {
 }
 
 // Dashboards this process already bound, keyed by requested and bound
-// `hostname:port`. A second in-process start (e.g. `/trace` twice in one
+// `hostname:port`. A second in-process start (e.g. `/stats` twice in one
 // session, or a caller passing back a fallback port) must return the live
 // handle: probing our own port can time out under load and would then start
 // yet another dashboard on a fallback port.
@@ -577,9 +446,9 @@ export interface StartServerOptions {
 
 /**
  * Start the dashboard on `port`, or reuse the current dashboard already serving it.
- * An older dashboard there is stopped and replaced; any other holder (a foreign
- * program, or a dashboard too busy to answer the identity probe) is left running
- * and the dashboard binds an ephemeral port instead.
+ * Any other holder (a foreign program, a dashboard of another version, or one
+ * too busy to answer the identity probe) is left running and the dashboard
+ * binds an ephemeral port instead.
  */
 export async function startServer(
 	port = 3847,
@@ -592,11 +461,16 @@ export async function startServer(
 		const active = activeServers.get(requestedKey);
 		if (active) return active;
 	}
-	await ensureClientBuild();
-	const register = (server: Server<undefined>): StatsServerHandle => {
+	if (!isLoopbackHost(hostname)) {
+		logger.warn("Stats dashboard bound to a non-loopback address: transcripts are readable from the network", {
+			hostname,
+		});
+	}
+	const register = (server: http.Server): StatsServerHandle => {
 		liveServers++;
 		let stopped = false;
-		const boundPort = server.port ?? port;
+		const address = server.address();
+		const boundPort = address && typeof address === "object" ? address.port : port;
 		const keys = port === 0 ? [`${hostname}:${boundPort}`] : [requestedKey, `${hostname}:${boundPort}`];
 		const handle: StatsServerHandle = {
 			hostname,
@@ -604,15 +478,12 @@ export async function startServer(
 			reused: false,
 			stop: () => {
 				for (const key of keys) activeServers.delete(key);
-				server.stop(true);
 				if (stopped) return;
 				stopped = true;
-				// The last dashboard in this process takes background ingest and Spotlight builds down with it.
-				if (--liveServers === 0) {
-					statsLive().stop();
-					spotlightBuilds.abort(new Error("Stats dashboard stopped"));
-					spotlightBuilds = new AbortController();
-				}
+				server.close();
+				server.closeAllConnections();
+				// The last dashboard in this process takes background ingest down with it.
+				if (--liveServers === 0) statsLive().stop();
 			},
 		};
 		for (const key of keys) activeServers.set(key, handle);
@@ -621,25 +492,30 @@ export async function startServer(
 
 	let claim = await prepareStatsPort(port, hostname);
 	if (claim === "bind") {
-		const server = bindDashboardServer(port, hostname);
+		const server = await bindDashboardServer(port, hostname);
 		if (server) return register(server);
 		claim = await recoverStatsPort(port, hostname);
 	}
 	if (claim === "reuse") return { hostname, port, reused: true, stop: () => {} };
 	if (claim === "bind") {
-		const server = bindDashboardServer(port, hostname);
+		const server = await bindDashboardServer(port, hostname);
 		if (server) return register(server);
 	}
 	logger.warn("Stats dashboard port is held by another process; serving on an ephemeral port", { hostname, port });
-	return register(createDashboardServer(0, hostname));
+	const fallback = await bindDashboardServer(0, hostname);
+	if (!fallback) throw new Error(`Could not bind the stats dashboard on ${hostname}`);
+	return register(fallback);
 }
 
-/** {@link createDashboardServer}, or null when the port is already in use. */
-function bindDashboardServer(port: number, hostname: string): Server<undefined> | null {
-	try {
-		return createDashboardServer(port, hostname);
-	} catch (error) {
-		if (error instanceof Error && "code" in error && error.code === "EADDRINUSE") return null;
-		throw error;
-	}
+/** A listening dashboard server, or null when the port is already in use. */
+function bindDashboardServer(port: number, hostname: string): Promise<http.Server | null> {
+	const { promise, resolve, reject } = Promise.withResolvers<http.Server | null>();
+	const server = createDashboardServer(hostname);
+	server.once("error", error => {
+		if (errorCode(error) === "EADDRINUSE") resolve(null);
+		else reject(error);
+	});
+	// exclusive: never share the port with another listener of this process's cluster.
+	server.listen({ port, host: hostname, exclusive: true }, () => resolve(server));
+	return promise;
 }
