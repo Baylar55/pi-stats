@@ -1,4 +1,6 @@
-import type { Database, SQLQueryBindings } from "bun:sqlite";
+import type { Database } from "./sqlite";
+
+type SQLQueryBindings = string | number | bigint | boolean | Uint8Array | null | undefined;
 
 /** Bind parameters per statement; SQLite builds older than 3.32 cap a statement at 999. */
 const MAX_BINDS = 999;
@@ -72,7 +74,7 @@ export class ChunkedInsert {
 			this.#changes += this.#database.query(this.#chunkSql).run(...this.#params).changes;
 		} else {
 			// Partial chunks vary in size; keep them out of the statement cache.
-			using statement = this.#database.prepare(this.#sql(this.#rows));
+			const statement = this.#database.prepare(this.#sql(this.#rows));
 			this.#changes += statement.run(...this.#params).changes;
 		}
 		this.#params = [];

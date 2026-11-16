@@ -1,17 +1,17 @@
 /**
  * Child-process probe for local day buckets. SQLite's `localtime` reads the
- * timezone the process started with (bun test pins only JS `Date`), so the
- * parent test spawns this script with `TZ` set and parses its JSON output.
+ * timezone the process started with, so the parent test spawns this script
+ * (bundled to JavaScript) with `TZ` set and parses its JSON output.
  *
- * The parent passes an isolated `PI_CONFIG_DIR` (and no `XDG_*_HOME`); the
- * stats database resolves from that config root.
+ * The parent passes an isolated `PI_CODING_AGENT_DIR`; the stats database
+ * resolves from it.
  *
  * argv: <isolated root> <timestamps as JSON array>
  */
-import { initDb, insertMessageStats } from "@oh-my-pi/omp-stats/db";
-import { getCostTimeSeries, getTimeSeries, refreshRollups } from "@oh-my-pi/omp-stats/rollup";
-import type { MessageStats } from "@oh-my-pi/omp-stats/types";
-import { getStatsDbPath } from "@oh-my-pi/pi-utils";
+import { getStatsDbPath } from "../../src/config";
+import { initDb, insertMessageStats } from "../../src/db";
+import { getCostTimeSeries, getTimeSeries, refreshRollups } from "../../src/rollup";
+import type { MessageStats } from "../../src/types";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const [isolatedRoot, timestampsJson] = process.argv.slice(2);

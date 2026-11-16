@@ -25,7 +25,8 @@
  * (an hour of data is small and indexed by timestamp).
  */
 
-import type { Database } from "bun:sqlite";
+import type { Database } from "./sqlite";
+import { sleep } from "./util";
 import { currentDb, unpricedRequestSql } from "./db";
 import type {
 	AgentType,
@@ -465,7 +466,7 @@ export async function refreshRollups(opts?: RefreshOptions): Promise<void> {
 		if (elapsed < REFRESH_TARGET_MS / 2) batch = Math.min(REFRESH_MAX_BATCH, batch * 2);
 		else if (elapsed > REFRESH_TARGET_MS * 2) batch = Math.max(1, Math.floor(batch / 2));
 		if (opts?.onProgress) opts.onProgress(getRollupStatus().dirtyHours);
-		await Bun.sleep(0);
+		await sleep(0);
 	}
 }
 
@@ -719,7 +720,7 @@ export function getStatsByFolder(cutoff: number | null = null, limit = Number.MA
 	).map(row => ({ folder: row.folder, ...toAggregatedStats(row) }));
 }
 
-/** Token usage per agent type (main, subagent, advisor). */
+/** Token usage per agent type (main, subagent). */
 export function getStatsByAgentType(cutoff: number | null = null): AgentTypeStats[] {
 	return queryMessages<{
 		agent_type: string | null;
@@ -1073,127 +1074,4 @@ export function getToolTimeSeries({ cutoff, bucketMs }: RangeWindow): ToolTimeSe
 		calls: row.calls,
 		errors: row.errors,
 	}));
-}
-
-// ---------------------------------------------------------------------------
-// Context facts (Spotlight tool-output share)
-// ---------------------------------------------------------------------------
-
-/** Per-bucket context facts of every transcript of one agent type: tool-result characters and output tokens. */
-export interface ContextFactPoint {
-	bucket: number;
-	agentType: AgentType;
-	resultChars: number;
-	outputTokens: number;
-}
-
-/** Tool-result characters per hour and agent type over `[cutoff, now]`; same union shape as {@link toolSource}. */
-function toolAgentSource(database: Database, cutoff: number | null, fine: boolean): Source {
-	if (fine) {
-		return {
-			sql: `SELECT ${toolAgentFacts("(timestamp / 300000) * 300000")} FROM tool_calls WHERE timestamp >= ? GROUP BY 1, agent_type`,
-			params: [cutoff ?? 0],
-		};
-	}
-	const hi = cutoff === null ? null : Math.ceil(cutoff / HOUR_MS) * HOUR_MS;
-	const { n } = database
-		.query(`SELECT COUNT(*) AS n FROM (SELECT 1 FROM tool_agent_dirty LIMIT ${EXACT_DIRTY_LIMIT + 1})`)
-		.get() as { n: number };
-	const exact = n <= EXACT_DIRTY_LIMIT;
-	const parts: string[] = [];
-	const params: number[] = [];
-	parts.push(
-		`SELECT bucket, agent_type, result_chars FROM tool_agent_rollup
-		 WHERE ${exact ? "bucket NOT IN (SELECT bucket FROM tool_agent_dirty)" : "1"}${hi !== null ? " AND bucket >= ?" : ""}`,
-	);
-	if (hi !== null) params.push(hi);
-	if (cutoff !== null && hi !== null && cutoff < hi) {
-		parts.push(
-			`SELECT ${toolAgentFacts(hourOf("timestamp"))} FROM tool_calls
-			 WHERE timestamp >= ? AND timestamp < ? GROUP BY 1, agent_type`,
-		);
-		params.push(cutoff, hi);
-	}
-	if (exact) {
-		parts.push(
-			`SELECT d.bucket AS bucket, t.agent_type AS agent_type, SUM(COALESCE(t.result_chars, 0)) AS result_chars
-			 FROM tool_agent_dirty d JOIN tool_calls t ON t.timestamp >= d.bucket AND t.timestamp < d.bucket + ${HOUR_MS}
-			 ${hi !== null ? "WHERE d.bucket >= ?" : ""}
-			 GROUP BY d.bucket, t.agent_type`,
-		);
-		if (hi !== null) params.push(hi);
-	}
-	return { sql: parts.join(" UNION ALL "), params };
-}
-
-/** {@link ContextFactPoint}s over a window, from the rollups (exact while few hours are dirty). */
-export function getContextFactSeries(database: Database, { cutoff, bucketMs }: RangeWindow): ContextFactPoint[] {
-	const fine = bucketMs < HOUR_MS;
-	const normalized = normalizeCutoff(cutoff);
-	const tools = toolAgentSource(database, normalized, fine);
-	const messages = messageSource(database, normalized, fine);
-	const points = new Map<string, ContextFactPoint>();
-	const point = (bucket: number, agentType: AgentType) => {
-		const key = `${bucket}:${agentType}`;
-		let p = points.get(key);
-		if (!p) {
-			p = { bucket, agentType, resultChars: 0, outputTokens: 0 };
-			points.set(key, p);
-		}
-		return p;
-	};
-	type Row = { bucket: number; agent_type: AgentType; n: number | null };
-	const toolRows = database
-		.query(
-			`SELECT ${epochBucket(bucketMs)} AS bucket, f.agent_type AS agent_type, SUM(f.result_chars) AS n
-			 FROM (${tools.sql}) f GROUP BY 1, 2`,
-		)
-		.all(...tools.params) as Row[];
-	for (const row of toolRows) point(row.bucket, row.agent_type).resultChars += row.n ?? 0;
-	const messageRows = database
-		.query(
-			`SELECT ${epochBucket(bucketMs)} AS bucket, f.agent_type AS agent_type, SUM(f.output_tokens) AS n
-			 FROM (${messages.sql}) f GROUP BY 1, 2`,
-		)
-		.all(...messages.params) as Row[];
-	for (const row of messageRows) point(row.bucket, row.agent_type).outputTokens += row.n ?? 0;
-	return [...points.values()].sort((a, b) => a.bucket - b.bucket);
-}
-
-/** A transcript's request span and its first request's prompt (input + cache read + cache write). */
-export interface SessionSpan {
-	sessionFile: string;
-	startedAt: number;
-	endedAt: number;
-	firstPrompt: number;
-}
-
-/**
- * Spans of the transcripts with a request at or after `endedAfter` (all when null), from `session_rollup` with
- * the same exactness rule as {@link getSessionRollups}.
- */
-export function getSessionSpans(database: Database, endedAfter: number | null): SessionSpan[] {
-	const { n } = database
-		.query(`SELECT COUNT(*) AS n FROM (SELECT 1 FROM session_dirty LIMIT ${EXACT_DIRTY_SESSIONS + 1})`)
-		.get() as { n: number };
-	const exact = n <= EXACT_DIRTY_SESSIONS;
-	const parts = [
-		`SELECT session_file, started_at, ended_at FROM session_rollup
-		 WHERE ended_at >= ?1${exact ? " AND session_file NOT IN (SELECT session_file FROM session_dirty)" : ""}`,
-	];
-	if (exact) {
-		parts.push(
-			`SELECT m.session_file, MIN(m.timestamp), MAX(m.timestamp + COALESCE(m.duration, 0))
-			 FROM session_dirty d JOIN messages m ON m.session_file = d.session_file
-			 GROUP BY m.session_file HAVING MAX(m.timestamp + COALESCE(m.duration, 0)) >= ?1`,
-		);
-	}
-	return database
-		.query(
-			`SELECT s.session_file AS sessionFile, s.started_at AS startedAt, s.ended_at AS endedAt,
-			 COALESCE((SELECT m.input_tokens + m.cache_read_tokens + m.cache_write_tokens FROM messages m
-			   WHERE m.timestamp = s.started_at AND m.session_file = s.session_file LIMIT 1), 0) AS firstPrompt
-			 FROM (${parts.join(" UNION ALL ")}) s`,
-		)
-		.all(endedAfter ?? 0) as SessionSpan[];
 }

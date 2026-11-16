@@ -1,7 +1,9 @@
-import { afterEach, describe, expect, it } from "bun:test";
-import * as os from "node:os";
+import { execFile } from "node:child_process";
 import * as path from "node:path";
-import { TempDir } from "@oh-my-pi/pi-utils";
+import { promisify } from "node:util";
+import { build } from "esbuild";
+import { afterEach, describe, expect, it } from "vitest";
+import { TempDir } from "./helpers/temp-dir";
 import { bucketAxis } from "../src/client/data/range";
 import { densify } from "../src/client/data/series";
 
@@ -13,33 +15,33 @@ type DaySeries = Record<"beforeRollup" | "afterRollup", Record<"series" | "cost"
 
 /**
  * Day series from a child process started with `tz`: SQLite's `localtime` only
- * reads the timezone the process started with, and bun test pins JS `Date` to UTC.
+ * reads the timezone the process started with. Plain Node cannot run the
+ * TypeScript probe (extensionless imports), so it is bundled first.
  */
 async function serverDaySeries(tz: string, timestamps: number[]): Promise<DaySeries> {
-	using temp = TempDir.createSync("@pi-stats-local-day-");
-	// Stats DB location follows PI_CONFIG_DIR / XDG_DATA_HOME, so isolate both.
-	const env: Record<string, string | undefined> = {
-		...process.env,
-		PI_CONFIG_DIR: path.relative(os.homedir(), temp.join("config")),
-		TZ: tz,
-	};
-	for (const key of ["XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"]) delete env[key];
-	const child = Bun.spawn(
-		[
+	const temp = TempDir.createSync("@pi-stats-local-day-");
+	try {
+		const probe = temp.join("probe.mjs");
+		await build({
+			entryPoints: [path.join(import.meta.dirname, "helpers/local-day-series-probe.ts")],
+			bundle: true,
+			platform: "node",
+			format: "esm",
+			outfile: probe,
+			external: ["bun:sqlite"],
+			logLevel: "silent",
+		});
+		// The stats database follows PI_CODING_AGENT_DIR: keep it inside the temp dir.
+		const env = { ...process.env, PI_CODING_AGENT_DIR: temp.join("agent"), TZ: tz };
+		const { stdout } = await promisify(execFile)(
 			process.execPath,
-			path.join(import.meta.dir, "helpers/local-day-series-probe.ts"),
-			temp.path(),
-			JSON.stringify(timestamps),
-		],
-		{ env, stdout: "pipe", stderr: "pipe" },
-	);
-	const [stdout, stderr, exitCode] = await Promise.all([
-		new Response(child.stdout).text(),
-		new Response(child.stderr).text(),
-		child.exited,
-	]);
-	expect({ exitCode, stderr }).toEqual({ exitCode: 0, stderr: "" });
-	return JSON.parse(stdout) as DaySeries;
+			[probe, temp.path(), JSON.stringify(timestamps)],
+			{ env },
+		);
+		return JSON.parse(stdout) as DaySeries;
+	} finally {
+		temp.removeSync();
+	}
 }
 
 function expectAllSeries(result: DaySeries, expected: number[][]) {
@@ -78,9 +80,9 @@ describe.skipIf(process.platform === "win32")("server day series", () => {
 describe("client day axis", () => {
 	const previousTz = process.env.TZ;
 	afterEach(() => {
-		// bun test pins `Date` to UTC with TZ unset; restore that explicitly so a
-		// zone set here cannot leak into later files.
-		process.env.TZ = previousTz ?? "UTC";
+		// Restore the zone the run started with so one set here cannot leak into later tests.
+		if (previousTz === undefined) delete process.env.TZ;
+		else process.env.TZ = previousTz;
 	});
 
 	it("ends the 7d axis on today's local midnight", () => {

@@ -1,5 +1,5 @@
-import { describe, expect, it } from "bun:test";
-import { initDb, insertMessageStats, insertToolCalls } from "@oh-my-pi/omp-stats/db";
+import { describe, expect, it } from "vitest";
+import { initDb, insertMessageStats, insertToolCalls } from "../src/db";
 import {
 	getDailyActivityFromRollup,
 	getOverallStats,
@@ -11,8 +11,8 @@ import {
 	getToolStats,
 	getToolTimeSeries,
 	refreshRollups,
-} from "@oh-my-pi/omp-stats/rollup";
-import type { MessageStats, ToolCallStats } from "@oh-my-pi/omp-stats/types";
+} from "../src/rollup";
+import type { MessageStats, ToolCallStats } from "../src/types";
 import { installStatsTestIsolation } from "./helpers/temp-agent";
 
 installStatsTestIsolation("@pi-stats-rollup-");

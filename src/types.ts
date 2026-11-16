@@ -1,10 +1,12 @@
-import type { AssistantMessage, ServiceTier, ServiceTierByFamily, StopReason, Usage } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, StopReason, ToolResultMessage, Usage, UserMessage } from "@earendil-works/pi-ai";
 import type { AgentType } from "./shared-types";
 
 export * from "./shared-types";
 
 /**
- * Extracted stats from an assistant message.
+ * Extracted stats from one usage source: an assistant message, or usage
+ * recorded outside one (a `usage` entry, a compaction or branch summary, a
+ * tool result).
  */
 export interface MessageStats {
 	/** Database ID */
@@ -13,7 +15,7 @@ export interface MessageStats {
 	sessionFile: string;
 	/** Entry ID within the session */
 	entryId: string;
-	/** Folder/project path (extracted from session filename) */
+	/** Folder/project path (the session header's `cwd`) */
 	folder: string;
 	/** Model ID */
 	model: string;
@@ -23,9 +25,9 @@ export interface MessageStats {
 	api: string;
 	/** Unix timestamp in milliseconds */
 	timestamp: number;
-	/** Request duration in milliseconds */
+	/** Request duration in milliseconds; null when neither the message nor a live timing recorded one */
 	duration: number | null;
-	/** Time to first token in milliseconds */
+	/** Time to first token in milliseconds; only live timings supply it, transcripts never do */
 	ttft: number | null;
 	/** Stop reason */
 	stopReason: StopReason;
@@ -33,22 +35,14 @@ export interface MessageStats {
 	errorMessage: string | null;
 	/** Token usage */
 	usage: Usage;
-	/** Which agent produced this message (main agent, task subagent, advisor) */
+	/** Which agent produced this message (main agent, nested subagent transcript) */
 	agentType: AgentType;
 	/**
-	 * Service tier the provider reported serving this turn, or `null` when the
-	 * provider reported none. Lets consumers separate a fast serving path's
-	 * throughput and premium traffic from standard-tier traffic. Always written by
-	 * `rowToMessageStats`; optional only because session fixtures that stand in
-	 * for ingest input are typed as `MessageStats` too.
-	 */
-	serviceTier?: ServiceTier | null;
-	/**
-	 * Ingest refused to price this request: a scheduled (time-based) card with no
-	 * recoverable request timestamp, so `usage.cost.total` of 0 is unknown spend
-	 * rather than a free request. Always written by `rowToMessageStats`; optional
-	 * only because session fixtures that stand in for ingest input are typed as
-	 * `MessageStats` too.
+	 * Ingest could not price this request: it used tokens but recorded no cost
+	 * and no rate card prices its model, so `usage.cost.total` of 0 is unknown
+	 * spend rather than a free request. Always written by `rowToMessageStats`;
+	 * optional only because session fixtures that stand in for ingest input are
+	 * typed as `MessageStats` too.
 	 */
 	costUnpriced?: boolean;
 }
@@ -56,10 +50,10 @@ export interface MessageStats {
 /**
  * Session-recorded token usage before pricing: counters are coerced to numbers
  * because their columns are NOT NULL, but `cost` is only present when the
- * session entry actually recorded one. Absence is meaningful — `resolveStoredCost`
- * estimates a request with no recorded price, whereas a recorded zero is a real
- * charge that scheduled cards freeze. `costUnpriced` is omitted because it is a
- * decision of the ingest path, not something the parser or a caller supplies.
+ * session entry actually recorded one, and may be partial in legacy files; the
+ * ingest path normalises it and prices a request that recorded none.
+ * `costUnpriced` is omitted because it is a decision of the ingest path, not
+ * something the parser or a caller supplies.
  */
 export interface MessageStatsInput extends Omit<MessageStats, "usage" | "costUnpriced"> {
 	usage: Omit<Usage, "cost"> & { cost?: Partial<Usage["cost"]> };
@@ -71,57 +65,84 @@ export interface MessageStatsInput extends Omit<MessageStats, "usage" | "costUnp
 export interface RequestDetails extends MessageStats {
 	/** The full conversation history or just the last turn. */
 	messages: unknown[];
-	/** The model's response; `null` for `model_usage` entries, which journal no payload. */
+	/** The model's response; `null` for usage recorded outside an assistant message, which journals no payload. */
 	output: unknown;
 }
 
 /**
- * Session log entry types.
+ * Session log entry types. They mirror pi's `SessionManager` shapes
+ * structurally: stats never imports the coding agent.
  */
 export interface SessionHeader {
 	type: "session";
-	version: number;
+	version?: number;
 	id: string;
 	timestamp: string;
 	cwd: string;
-	title?: string;
+	/** Transcript this session was forked or branched from. */
+	parentSession?: string;
 }
 
-export interface SessionMessageEntry {
+/** Fields every entry below the header carries (v1 transcripts get them assigned by the parser). */
+export interface SessionEntryBase {
+	id: string;
+	parentId: string | null;
+	timestamp: string;
+}
+
+/** Message roles the stats do not read: the prompt/tool loadout, extension messages, `!` shell runs. */
+export interface SessionOtherMessage {
+	role: "system" | "custom" | "bashExecution";
+	timestamp?: number;
+	[key: string]: unknown;
+}
+
+export type SessionMessage = AssistantMessage | ToolResultMessage | UserMessage | SessionOtherMessage;
+
+export interface SessionMessageEntry extends SessionEntryBase {
 	type: "message";
-	id: string;
-	parentId: string | null;
-	timestamp: string;
-	message: AssistantMessage | { role: "user" | "toolResult" };
+	message: SessionMessage;
 }
 
-export interface SessionServiceTierChangeEntry {
-	type: "service_tier_change";
-	id: string;
-	parentId?: string | null;
-	timestamp: string;
-	serviceTier: ServiceTierByFamily | ServiceTier | null;
-}
-
-export interface SessionModelUsageEntry {
-	type: "model_usage";
-	id: string;
-	parentId: string | null;
-	timestamp: string;
-	purpose: string;
-	role?: string;
-	api: string;
+/** Model-attributed usage outside an assistant message (`kind` names the operation, e.g. `cache_warm`). */
+export interface SessionUsageEntry extends SessionEntryBase {
+	type: "usage";
+	kind: string;
 	provider: string;
 	model: string;
 	usage: Usage;
-	stopReason?: StopReason;
-	errorMessage?: string;
+	note?: string;
 }
 
-/**
- * Custom journal entry (`tool_execution_start`, `session_exit`, …). Mirrors
- * the coding-agent shape structurally — stats never imports coding-agent.
- */
+/** The user switched models; the latest one is the session's selected model. */
+export interface SessionModelChangeEntry extends SessionEntryBase {
+	type: "model_change";
+	provider: string;
+	modelId: string;
+}
+
+export interface SessionCompactionEntry extends SessionEntryBase {
+	type: "compaction";
+	summary: string;
+	firstKeptEntryId: string;
+	tokensBefore: number;
+	/** Usage of the LLM call(s) that wrote the summary. */
+	usage?: Usage;
+	details?: unknown;
+	fromHook?: boolean;
+}
+
+export interface SessionBranchSummaryEntry extends SessionEntryBase {
+	type: "branch_summary";
+	fromId: string;
+	summary: string;
+	/** Usage of the LLM call that wrote the summary. */
+	usage?: Usage;
+	details?: unknown;
+	fromHook?: boolean;
+}
+
+/** Extension state (`customType` names the extension); never part of the LLM context. */
 export interface SessionCustomEntry {
 	type: "custom";
 	id?: string;
@@ -131,9 +152,24 @@ export interface SessionCustomEntry {
 	data?: Record<string, unknown>;
 }
 
-/** Structural variants the trace builder matches on beyond messages. */
+/** Extension-injected message that is part of the LLM context. */
+export interface SessionCustomMessageEntry extends SessionEntryBase {
+	type: "custom_message";
+	customType: string;
+	content: unknown;
+	display: boolean;
+	details?: unknown;
+}
+
+/** Session metadata, e.g. the display name set with `/name`. */
+export interface SessionInfoEntry extends SessionEntryBase {
+	type: "session_info";
+	name?: string;
+}
+
+/** Structural variants nothing reads a field of beyond the envelope. */
 export interface SessionTypedEntry {
-	type: "session_init" | "compaction" | "model_change" | "mode_change" | "reset_boundary";
+	type: "thinking_level_change" | "context_edit" | "label";
 	id?: string;
 	parentId?: string | null;
 	timestamp?: string;
@@ -143,9 +179,13 @@ export interface SessionTypedEntry {
 export type SessionEntry =
 	| SessionHeader
 	| SessionMessageEntry
-	| SessionServiceTierChangeEntry
-	| SessionModelUsageEntry
+	| SessionUsageEntry
+	| SessionModelChangeEntry
+	| SessionCompactionEntry
+	| SessionBranchSummaryEntry
 	| SessionCustomEntry
+	| SessionCustomMessageEntry
+	| SessionInfoEntry
 	| SessionTypedEntry
 	| { type: string };
 
@@ -185,7 +225,7 @@ export interface UserMessageStats {
 	blame: number;
 	/** Judge-facing prose (see `judgeProse`); empty when the message was all markup. */
 	prose: string;
-	/** Hex `Bun.hash` of `prose`, keying the shared verdict cache; empty when `prose` is. */
+	/** `hashHex` of `prose`, keying the shared verdict cache; empty when `prose` is. */
 	proseHash: string;
 }
 
@@ -215,7 +255,7 @@ export interface ToolCallStats {
 	entryId: string;
 	/** Provider-assigned tool call ID (unique within a session) */
 	toolCallId: string;
-	/** Folder/project path (extracted from session filename) */
+	/** Folder/project path (the session header's `cwd`) */
 	folder: string;
 	/** Tool name */
 	toolName: string;

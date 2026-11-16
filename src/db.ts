@@ -1,28 +1,11 @@
-import { Database } from "bun:sqlite";
 import * as fs from "node:fs/promises";
-import type { ServiceTier, Usage } from "@oh-my-pi/pi-ai";
-import { pricingPeerFor } from "@oh-my-pi/pi-catalog/compat/behavior";
-import {
-	calculateUncachedInputCost,
-	calculateUsageCost,
-	type GeneratedProvider,
-	getBundledModel,
-	hasRecurringTariff,
-} from "@oh-my-pi/pi-catalog/models";
-import type { ModelCost } from "@oh-my-pi/pi-catalog/types";
-import { getConfigRootDir, getStatsDbPath, VERSION } from "@oh-my-pi/pi-utils";
+import * as path from "node:path";
 import { ChunkedInsert } from "./chunked-insert";
-import { classifyAgentType, type ParseSessionResult, type SessionParserState } from "./parser";
+import { getStatsDbPath } from "./config";
+import type { ParseSessionResult, SessionParserState } from "./parser";
+import { createRateLookup, type EstimatedCost, estimateCost, type ModelRates, type UsageCost, uncachedInputCost } from "./pricing";
 import { ensureRollupSchema, getDailyActivityFromRollup } from "./rollup";
-import {
-	mergeRanges,
-	type SpotlightCallResultLink,
-	type SpotlightCallRow,
-	type SpotlightNeedRow,
-	type SpotlightRequestRow,
-	type SpotlightSessionRow,
-	type SpotlightShapeRow,
-} from "./spotlight-ingest";
+import { Database } from "./sqlite";
 import type {
 	AgentType,
 	DailyActivityPoint,
@@ -35,58 +18,20 @@ import type {
 	UserMessageStats,
 } from "./types";
 
-type UsageCost = Usage["cost"];
-type CostTokens = Pick<Usage, "input" | "output" | "cacheRead" | "cacheWrite" | "orchestration" | "cttl">;
-
-const ZERO_USAGE_COST: UsageCost = {
-	input: 0,
-	output: 0,
-	cacheRead: 0,
-	cacheWrite: 0,
-	total: 0,
-};
-
 /**
- * Predicate counting one stored request as "unpriced" — the public rate card
- * has no charge for it, so its zero is unknown spend rather than free usage.
- * Two shapes store that zero:
- *   - `xai-oauth` bills through the SuperGrok subscription, so ingestion
- *     deliberately records no per-request price;
- *   - `cost_unpriced = 1`, set by `insertMessageStats` when `resolveStoredCost`
- *     refuses to price a scheduled (time-based) card whose entry carried no
- *     recoverable request timestamp — the epoch would silently become the
- *     tariff. Such a row keeps its real tokens and its zero until a re-parse
- *     recovers the time.
+ * Predicate counting one stored request as "unpriced" — no provider has a
+ * public price for its model, so its zero is unknown spend rather than free
+ * usage. `cost_unpriced = 1` is set by `insertMessageStats` (and kept current
+ * by `setModelPrices`) when a request that used tokens recorded no cost and
+ * the rate card prices neither its model nor a pricing peer.
  *
- * Nothing else sets the marker: an explicit recorded zero, a free flat card,
- * and a model with no catalog card at all keep `cost_unpriced = 0` even at the
- * parser's timestamp sentinel, because their zero is a real price.
+ * Nothing else sets the marker: a recorded cost, an estimate from the rate
+ * card, and a request that used no tokens keep `cost_unpriced = 0`.
  * `prefix` qualifies the columns for queries that alias `messages`.
  */
 export function unpricedRequestSql(prefix = ""): string {
 	return `CASE WHEN ${prefix}total_tokens > 0 AND ${prefix}cost_total = 0
-		AND (${prefix}provider = 'xai-oauth' OR ${prefix}cost_unpriced = 1) THEN 1 ELSE 0 END`;
-}
-
-interface CostBackfillRow {
-	id: number;
-	provider: string;
-	model: string;
-	timestamp: number;
-	input_tokens: number;
-	output_tokens: number;
-	cache_read_tokens: number;
-	cache_write_tokens: number;
-}
-
-interface NoCacheInputCostBackfillRow {
-	id: number;
-	provider: string;
-	model: string;
-	timestamp: number;
-	input_tokens: number;
-	cache_read_tokens: number;
-	cache_write_tokens: number;
+		AND ${prefix}cost_unpriced = 1 THEN 1 ELSE 0 END`;
 }
 
 let db: Database | null = null;
@@ -97,64 +42,21 @@ export function currentDb(): Database | null {
 }
 
 const BACKFILL_COMPLETE = "complete";
-const BACKFILL_PENDING = "pending";
-const USER_MESSAGES_BACKFILL_KEY = "user_messages_v10";
-// v2: replies are linked past the non-message entries (system-prompt digest,
-// extension notices, side-model usage) the agent writes before them.
-const USER_MESSAGE_LINKS_REPAIR_KEY = "user_message_links_v2";
-// v2: the parser also records the served service tier per message, so a full
-// re-parse fills `service_tier` and re-derives ultrafast premium counts that the
-// v1 pass (priority only) left at zero.
-const PRIORITY_PREMIUM_REQUESTS_BACKFILL_KEY = "premium_requests_priority_v2";
-const AGENT_TYPE_BACKFILL_KEY = "agent_type_v1";
 const FORK_DEDUPE_KEY = "fork_dedupe_v1";
-// v2: tool-name sanitization at ingest (see `sanitizeToolName` in parser.ts)
-// collapses provider-side garbage names; a full re-parse replaces the polluted
-// rows already stored in existing databases.
-// v3: reclassify synthetic non-executions so historical tool error rates are corrected.
-const TOOL_CALLS_BACKFILL_KEY = "tool_calls_v3";
-// Older ingests dropped `Usage.orchestration` (never a stored column) when
-// pricing, so subscription models billed on orchestration tokens — multi-agent
-// Grok most notably — were priced from conversation buckets alone and could not
-// reach the inclusive 200K tier. A one-time full re-parse repairs them through
-// the cost-refreshing UPSERT in `insertMessageStats`.
-const COST_REINGEST_BACKFILL_KEY = "messages_cost_reingest_v1";
-// The absence-aware `resolveStoredCost` and the `cost_unpriced` marker only
-// reach already-ingested rows through a re-parse, and the reingest sentinel
-// above is already spent for them — without this one, every historical row
-// keeps `cost_unpriced = 0` and unknown scheduled spend reports as free.
-const COST_UNPRICED_BACKFILL_KEY = "messages_cost_unpriced_v1";
-// Rows predating the `cost_no_cache_input` column are NULL; ingest always
-// writes a value, so one pass settles the column for good.
-const NO_CACHE_INPUT_BACKFILL_KEY = "cost_no_cache_input_v1";
-// Zero-cost rows are repriced from the bundled catalog once per release (the
-// value stored is the version that ran it), since only a catalog update can
-// price a model it could not price before.
-const CATALOG_COST_BACKFILL_KEY = "catalog_cost_backfill";
-// The Spotlight tables are filled by the parser; transcripts ingested before
-// they existed are re-parsed once. Only files modified since the experiment
-// shipped can hold its entries, so older cursors stay put.
-const SPOTLIGHT_BACKFILL_KEY = "spotlight_v1";
-const SPOTLIGHT_SINCE_MS = Date.parse("2026-10-28T00:00:00Z");
-// Experiment sessions parsed before `spotlight_calls.edits` existed are
-// re-parsed once (only them: they are few) so recovery detection sees edits.
-// (`v3`: a build that ran the `v2` pass may have had its sessions re-parsed
-// again by an older build, which records no edits.)
-const SPOTLIGHT_EDITS_BACKFILL_KEY = "spotlight_v3_edits";
-// Experiment sessions parsed before results carried heat, kept runs, plain sizes
-// and needed lines are re-parsed once (only them, never the whole history).
-const SPOTLIGHT_NEEDS_BACKFILL_KEY = "spotlight_v4_needs";
-// Experiment sessions parsed before calls carried argument tokens (the generic
-// rerun rule for every tool beyond read and bash) are re-parsed once.
-const SPOTLIGHT_ARG_TOKENS_BACKFILL_KEY = "spotlight_v5_arg_tokens";
-// The experiment became a toggle: sessions are marked by `spotlight:session`
-// (which older builds did not read) and legacy `spotlight:assignment` sessions
-// count only with the arm that shipped. Every transcript that can hold
-// Spotlight entries is re-parsed once by the new rules.
-const SPOTLIGHT_TOGGLE_BACKFILL_KEY = "spotlight_v6_toggle";
-function shouldResetBackfill(value: string | undefined): boolean {
-	return value !== BACKFILL_COMPLETE && value !== BACKFILL_PENDING;
-}
+
+// A live timing fills what the transcript lacks: pi records no time to first
+// token, and only newer messages carry `durationMs`.
+const TIMING_TTFT = (ttft: string) => `COALESCE(${ttft}, ttft)`;
+const TIMING_DURATION = (duration: string) => `COALESCE(duration, ${duration})`;
+const TIMING_OF_NEW_MESSAGE = "FROM timings t WHERE t.session_file = NEW.session_file AND t.entry_id = NEW.entry_id";
+/** `AFTER INSERT/UPDATE ON timings` body: carry the timing onto its message, if that is stored and changes. */
+const APPLY_TIMING_TO_MESSAGE = `
+	UPDATE messages
+	SET ttft = ${TIMING_TTFT("NEW.first_token_at - NEW.request_start")},
+		duration = ${TIMING_DURATION("NEW.end_at - NEW.request_start")}
+	WHERE session_file = NEW.session_file AND entry_id = NEW.entry_id
+		AND (duration IS NULL OR ttft IS NOT ${TIMING_TTFT("NEW.first_token_at - NEW.request_start")});`;
+
 /**
  * Initialize the database and create tables.
  */
@@ -162,7 +64,9 @@ export async function initDb(): Promise<Database> {
 	if (db) return db;
 
 	// Ensure directory exists
-	await fs.mkdir(getConfigRootDir(), { recursive: true });
+	await fs.mkdir(path.dirname(getStatsDbPath()), { recursive: true });
+	// A concurrent caller may have opened the database while this one awaited.
+	if (db) return db;
 
 	db = new Database(getStatsDbPath());
 	// Install the busy handler BEFORE any lock-taking statement. See
@@ -180,11 +84,6 @@ export async function initDb(): Promise<Database> {
 	db.run("PRAGMA temp_store = MEMORY");
 	db.run("PRAGMA cache_size = -65536");
 	db.run("PRAGMA wal_autocheckpoint = 16384");
-
-	// Whether `messages` predates this init — drives the one-time agent_type
-	// backfill below, so it must be sampled before CREATE TABLE adds the table.
-	const messagesTableExisted =
-		db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'messages'").get() !== undefined;
 
 	// Create tables
 	db.run(`
@@ -206,7 +105,7 @@ export async function initDb(): Promise<Database> {
 			cache_read_tokens INTEGER NOT NULL,
 			cache_write_tokens INTEGER NOT NULL,
 			total_tokens INTEGER NOT NULL,
-			premium_requests REAL NOT NULL,
+			premium_requests REAL NOT NULL DEFAULT 0,
 			cost_input REAL NOT NULL,
 			cost_output REAL NOT NULL,
 			cost_cache_read REAL NOT NULL,
@@ -216,6 +115,10 @@ export async function initDb(): Promise<Database> {
 			cost_unpriced INTEGER NOT NULL DEFAULT 0,
 			agent_type TEXT NOT NULL DEFAULT 'main',
 			service_tier TEXT,
+			-- The cost columns come from the rate card (1) or the transcript (0); only the former are re-priced.
+			cost_estimated INTEGER NOT NULL DEFAULT 0,
+			-- 1-hour subset of cache_write_tokens, billed at its own rate.
+			cache_write_1h_tokens INTEGER NOT NULL DEFAULT 0,
 			UNIQUE(session_file, entry_id)
 		);
 
@@ -223,16 +126,14 @@ export async function initDb(): Promise<Database> {
 		-- keeps one transcript's rows in a few neighbouring leaves; entry-first
 		-- scattered every insert, delete and lookup across the whole index. The
 		-- composite also serves every timestamp range scan.
-		DROP INDEX IF EXISTS idx_messages_timestamp;
-		DROP INDEX IF EXISTS idx_messages_entry_timestamp;
 		CREATE INDEX IF NOT EXISTS idx_messages_timestamp_entry ON messages(timestamp, entry_id);
-		CREATE INDEX IF NOT EXISTS idx_messages_model ON messages(model);
+		-- Re-pricing walks one (model, provider) at a time.
+		CREATE INDEX IF NOT EXISTS idx_messages_model_provider ON messages(model, provider);
 		CREATE INDEX IF NOT EXISTS idx_messages_folder ON messages(folder);
-		-- UNIQUE(session_file, entry_id) already indexes session_file lookups.
-		DROP INDEX IF EXISTS idx_messages_session;
 		CREATE INDEX IF NOT EXISTS idx_messages_timestamp_model_provider ON messages(timestamp, model, provider);
 		CREATE INDEX IF NOT EXISTS idx_messages_timestamp_folder ON messages(timestamp, folder);
 		CREATE INDEX IF NOT EXISTS idx_messages_stop_reason_timestamp ON messages(stop_reason, timestamp);
+		CREATE INDEX IF NOT EXISTS idx_messages_timestamp_agent_type ON messages(timestamp, agent_type);
 
 		CREATE TABLE IF NOT EXISTS file_offsets (
 			session_file TEXT PRIMARY KEY,
@@ -262,10 +163,9 @@ export async function initDb(): Promise<Database> {
 			UNIQUE(session_file, entry_id)
 		);
 
-		DROP INDEX IF EXISTS idx_user_messages_timestamp;
-		DROP INDEX IF EXISTS idx_user_messages_entry_timestamp;
 		CREATE INDEX IF NOT EXISTS idx_user_messages_timestamp_entry ON user_messages(timestamp, entry_id);
 		CREATE INDEX IF NOT EXISTS idx_user_messages_timestamp_model ON user_messages(timestamp, model, provider);
+		CREATE INDEX IF NOT EXISTS idx_user_messages_prose_hash ON user_messages(prose_hash);
 
 		-- Judge verdicts keyed by prose hash: identical messages share one verdict,
 		-- and verdicts outlive user_messages re-parses. No backfill wipes this table.
@@ -296,8 +196,6 @@ export async function initDb(): Promise<Database> {
 			UNIQUE(session_file, tool_call_id)
 		);
 
-		DROP INDEX IF EXISTS idx_tool_calls_timestamp;
-		DROP INDEX IF EXISTS idx_tool_calls_entry_timestamp;
 		CREATE INDEX IF NOT EXISTS idx_tool_calls_timestamp_entry ON tool_calls(timestamp, entry_id);
 		CREATE INDEX IF NOT EXISTS idx_tool_calls_tool_timestamp ON tool_calls(tool_name, timestamp);
 
@@ -306,313 +204,48 @@ export async function initDb(): Promise<Database> {
 			value TEXT NOT NULL
 		);
 
-		-- Spotlight experiment sessions: the first Spotlight marker of each transcript.
-		CREATE TABLE IF NOT EXISTS spotlight_sessions (
-			session_file TEXT PRIMARY KEY,
-			folder TEXT NOT NULL,
-			marked_at INTEGER NOT NULL,
-			cwd TEXT,
-			title TEXT
-		) WITHOUT ROWID;
-
-		-- One evaluated tool result: its spotlight:shape entry and its result's details.spotlight, upserted.
-		CREATE TABLE IF NOT EXISTS spotlight_results (
-			session_file TEXT NOT NULL,
-			tool_call_id TEXT NOT NULL,
-			timestamp INTEGER NOT NULL,
-			tool TEXT NOT NULL,
-			in_chars INTEGER NOT NULL,
-			out_chars INTEGER NOT NULL,
-			in_tokens INTEGER NOT NULL,
-			out_tokens INTEGER NOT NULL,
-			steps TEXT NOT NULL,
-			has_details INTEGER NOT NULL,
-			holdout INTEGER NOT NULL DEFAULT 0,
-			original_url TEXT,
-			path TEXT,
-			start_line INTEGER,
-			lines INTEGER,
-			hidden TEXT,
-			hidden_lines INTEGER NOT NULL DEFAULT 0,
-			artifacts TEXT,
-			sp_calls INTEGER,
-			sp_failures INTEGER,
-			sp_failure_causes TEXT,
-			sp_ms REAL,
-			sp_cost REAL,
-			shape_ms REAL,
-			plain_chars INTEGER,
-			plain_tokens INTEGER,
-			capped_tokens INTEGER,
-			score_free INTEGER NOT NULL DEFAULT 0,
-			heat TEXT,
-			kept TEXT,
-			gated INTEGER NOT NULL DEFAULT 0,
-			windows TEXT,
-			PRIMARY KEY (session_file, tool_call_id)
-		) WITHOUT ROWID;
-		CREATE INDEX IF NOT EXISTS idx_spotlight_results_call ON spotlight_results(tool_call_id);
-
-		-- Every tool call of an experiment session from its marker on, in order.
-		CREATE TABLE IF NOT EXISTS spotlight_calls (
-			session_file TEXT NOT NULL,
-			tool_call_id TEXT NOT NULL,
-			entry_id TEXT NOT NULL,
-			timestamp INTEGER NOT NULL,
-			seq INTEGER NOT NULL,
-			tool_name TEXT NOT NULL,
-			calls_in_turn INTEGER NOT NULL,
-			target TEXT NOT NULL,
-			result_chars INTEGER,
-			artifacts TEXT,
-			edits TEXT,
-			arg_tokens TEXT,
-			PRIMARY KEY (session_file, tool_call_id)
-		) WITHOUT ROWID;
-		CREATE INDEX IF NOT EXISTS idx_spotlight_calls_entry ON spotlight_calls(entry_id, timestamp);
-
-		-- Main-loop requests of an experiment session (side requests journaled as model_usage excluded).
-		CREATE TABLE IF NOT EXISTS spotlight_requests (
+		-- Request timings the pi extension measures live (epoch ms), keyed like the
+		-- message they belong to. They outlive re-parses of their transcript.
+		CREATE TABLE IF NOT EXISTS timings (
 			session_file TEXT NOT NULL,
 			entry_id TEXT NOT NULL,
-			timestamp INTEGER NOT NULL,
+			request_start INTEGER NOT NULL,
+			first_token_at INTEGER,
+			end_at INTEGER NOT NULL,
 			PRIMARY KEY (session_file, entry_id)
 		) WITHOUT ROWID;
-		CREATE INDEX IF NOT EXISTS idx_spotlight_requests_entry ON spotlight_requests(entry_id, timestamp);
 
-		-- Original lines (1-based positions) a shaped read's later calls needed; open while still collecting.
-		CREATE TABLE IF NOT EXISTS spotlight_needs (
-			session_file TEXT NOT NULL,
-			tool_call_id TEXT NOT NULL,
-			file TEXT NOT NULL,
-			open INTEGER NOT NULL,
-			reread TEXT NOT NULL,
-			edit TEXT NOT NULL,
-			PRIMARY KEY (session_file, tool_call_id)
+		-- A timing and its message arrive in either order (and a rebuilt file
+		-- re-inserts its messages), so each side applies the timing when it lands.
+		-- The message update fires the rollup triggers like any other change.
+		CREATE TRIGGER IF NOT EXISTS timings_insert_apply AFTER INSERT ON timings BEGIN${APPLY_TIMING_TO_MESSAGE}
+		END;
+		CREATE TRIGGER IF NOT EXISTS timings_update_apply AFTER UPDATE ON timings BEGIN${APPLY_TIMING_TO_MESSAGE}
+		END;
+		CREATE TRIGGER IF NOT EXISTS timings_message_insert_apply AFTER INSERT ON messages BEGIN
+			UPDATE messages
+			SET ttft = ${TIMING_TTFT(`(SELECT t.first_token_at - t.request_start ${TIMING_OF_NEW_MESSAGE})`)},
+				duration = ${TIMING_DURATION(`(SELECT t.end_at - t.request_start ${TIMING_OF_NEW_MESSAGE})`)}
+			WHERE id = NEW.id AND EXISTS (SELECT 1 ${TIMING_OF_NEW_MESSAGE});
+		END;
+
+		-- The rate card (USD per 1M tokens), replaced as a whole by setModelPrices.
+		-- Model-first key: a pricing-peer lookup scans one model's providers.
+		CREATE TABLE IF NOT EXISTS model_prices (
+			provider TEXT NOT NULL,
+			model TEXT NOT NULL,
+			input REAL NOT NULL,
+			output REAL NOT NULL,
+			cache_read REAL NOT NULL,
+			cache_write REAL NOT NULL,
+			tiers TEXT,
+			PRIMARY KEY (model, provider)
 		) WITHOUT ROWID;
 	`);
 
-	const offsetColumns = db.query("PRAGMA table_info(file_offsets)").all() as { name: string }[];
-	if (!offsetColumns.some(column => column.name === "parser_state")) {
-		db.run("ALTER TABLE file_offsets ADD COLUMN parser_state TEXT");
-	}
-	dropSpotlightArms(db);
-	// No result was held out before this column existed, so the default is exact for old rows.
-	const spotlightResultColumns = db.query<{ name: string }, []>("PRAGMA table_info(spotlight_results)").all();
-	if (!spotlightResultColumns.some(column => column.name === "holdout")) {
-		db.run("ALTER TABLE spotlight_results ADD COLUMN holdout INTEGER NOT NULL DEFAULT 0");
-	}
-	// Filled for existing rows by the `spotlight_v4_needs` re-parse; until then plain sizes are estimated.
-	for (const [column, type] of [
-		["plain_chars", "INTEGER"],
-		["plain_tokens", "INTEGER"],
-		["capped_tokens", "INTEGER"],
-		["score_free", "INTEGER NOT NULL DEFAULT 0"],
-		["heat", "TEXT"],
-		["kept", "TEXT"],
-		// No read was gated before this existed: the default is exact.
-		["gated", "INTEGER NOT NULL DEFAULT 0"],
-		// Failed calls by cause (JSON); shape entries before pi journaled it leave it NULL.
-		["sp_failure_causes", "TEXT"],
-		// A `;`/`,` list read's windows (JSON); NULL for a single-window original, which the columns above describe.
-		["windows", "TEXT"],
-	] as const) {
-		if (!spotlightResultColumns.some(existing => existing.name === column)) {
-			db.run(`ALTER TABLE spotlight_results ADD COLUMN ${column} ${type}`);
-		}
-	}
-	// pi's read mark went with its former edit gate.
-	if (spotlightResultColumns.some(column => column.name === "edit_likely")) {
-		db.run("ALTER TABLE spotlight_results DROP COLUMN edit_likely");
-	}
-	const spotlightCallColumns = db.query<{ name: string }, []>("PRAGMA table_info(spotlight_calls)").all();
-	if (!spotlightCallColumns.some(column => column.name === "edits")) {
-		db.run("ALTER TABLE spotlight_calls ADD COLUMN edits TEXT");
-	}
-	// Filled for existing rows by the `spotlight_v5_arg_tokens` re-parse; until then no generic rerun is detected.
-	if (!spotlightCallColumns.some(column => column.name === "arg_tokens")) {
-		db.run("ALTER TABLE spotlight_calls ADD COLUMN arg_tokens TEXT");
-	}
-	const messageColumns = db.query("PRAGMA table_info(messages)").all() as { name: string }[];
-	if (!messageColumns.some(column => column.name === "premium_requests")) {
-		db.run("ALTER TABLE messages ADD COLUMN premium_requests REAL NOT NULL DEFAULT 0");
-	}
-	if (!messageColumns.some(column => column.name === "cost_no_cache_input")) {
-		db.run("ALTER TABLE messages ADD COLUMN cost_no_cache_input REAL");
-	}
-	// Rows ingested before this column existed carry no served tier; a re-parse
-	// fills them from the session's assistant messages.
-	if (!messageColumns.some(column => column.name === "service_tier")) {
-		db.run("ALTER TABLE messages ADD COLUMN service_tier TEXT");
-	}
-	// Rows ingested before this column existed default to 0 (not unpriced), so
-	// their epoch-sentinel zeros read as free until a re-parse rewrites them.
-	if (!messageColumns.some(column => column.name === "cost_unpriced")) {
-		db.run("ALTER TABLE messages ADD COLUMN cost_unpriced INTEGER NOT NULL DEFAULT 0");
-	}
-	// Token-usage-by-agent: each message is classified main / subagent / advisor
-	// from its transcript path. A brand-new table gets the column from CREATE
-	// TABLE and the parser labels rows at insert time; a pre-existing table gets
-	// the column here (defaulting every prior row to 'main') and enrolls the
-	// one-time path-based reclassification, gated by a meta sentinel.
-	const hasAgentTypeColumn = messageColumns.some(column => column.name === "agent_type");
-	if (!hasAgentTypeColumn) {
-		db.run("ALTER TABLE messages ADD COLUMN agent_type TEXT NOT NULL DEFAULT 'main'");
-	}
-	// For any pre-existing table, enroll the backfill PENDING unless a prior run
-	// already settled the sentinel — `OR IGNORE` leaves an existing
-	// COMPLETE/PENDING value intact, so an ALTER that committed before its
-	// sentinel write (process killed in between) still reclassifies on the next
-	// init instead of silently leaving every row as the 'main' default. A
-	// brand-new empty table has nothing to reclassify, so it settles COMPLETE.
-	db.query("INSERT OR IGNORE INTO meta (key, value) VALUES (?, ?)").run(
-		AGENT_TYPE_BACKFILL_KEY,
-		messagesTableExisted ? BACKFILL_PENDING : BACKFILL_COMPLETE,
-	);
-	db.run("CREATE INDEX IF NOT EXISTS idx_messages_timestamp_agent_type ON messages(timestamp, agent_type)");
-	// Each behavior-metric bump invalidates previously-ingested rows. We detect
-	// the stale schema by column name and drop the table; `IF NOT EXISTS` above
-	// already produced the new schema, but we want a clean wipe + re-ingest.
-	// `backfillUserMessages` then clears `file_offsets` so the next sync
-	// re-parses every session under the current metric definitions.
-	//   v1 -> v2: yelling sentences replace `caps_words`.
-	//   v2 -> v3: `drama_runs` folded into a single `anguish` signal that
-	//             also captures elongated interjections, `dude`, and dot runs,
-	//             gated on a stripped prose-line budget.
-	//   v3 -> v4: added `negation`, `repetition`, `blame` frustration signals
-	//             plus profanity dictionary expansion + word-boundary fix.
-	//   v4 -> v5: column `yelling_sentences` renamed to `yelling` to match
-	//             the other single-word signal columns.
-	//   v5 -> v6: dropped `git` from the profanity word list.
-	//   v6 -> v7: dropped dot runs from `anguish`, technical-collision and
-	//             opinion words from the profanity list; gated yelling on
-	//             multi-word caps and bare `no` on interjection use.
-	//   v7 -> v8: `no-op` compounds no longer count as negation; recovered
-	//             measured false negatives: `:(` emoticons -> anguish,
-	//             `why (would|did) you` -> blame, `makes no sense` -> negation.
-	const userMessageColumns = db.query("PRAGMA table_info(user_messages)").all() as {
-		name: string;
-	}[];
-	const hasStaleColumn =
-		userMessageColumns.length > 0 &&
-		(userMessageColumns.some(column => column.name === "caps_words") ||
-			userMessageColumns.some(column => column.name === "drama_runs") ||
-			userMessageColumns.some(column => column.name === "yelling_sentences"));
-	const hasV4Columns = userMessageColumns.some(column => column.name === "negation");
-	const hasOldUserMessages = userMessageColumns.length > 0;
-	if (hasStaleColumn || (hasOldUserMessages && !hasV4Columns)) {
-		db.run("DROP TABLE user_messages");
-		db.run(`
-			CREATE TABLE user_messages (
-				id INTEGER PRIMARY KEY AUTOINCREMENT,
-				session_file TEXT NOT NULL,
-				entry_id TEXT NOT NULL,
-				folder TEXT NOT NULL,
-				timestamp INTEGER NOT NULL,
-				model TEXT,
-				provider TEXT,
-				chars INTEGER NOT NULL,
-				words INTEGER NOT NULL,
-				yelling INTEGER NOT NULL,
-				profanity INTEGER NOT NULL,
-				anguish INTEGER NOT NULL,
-				negation INTEGER NOT NULL DEFAULT 0,
-				repetition INTEGER NOT NULL DEFAULT 0,
-				blame INTEGER NOT NULL DEFAULT 0,
-				prose TEXT NOT NULL DEFAULT '',
-				prose_hash TEXT NOT NULL DEFAULT '',
-				UNIQUE(session_file, entry_id)
-			);
-			CREATE INDEX IF NOT EXISTS idx_user_messages_timestamp_entry ON user_messages(timestamp, entry_id);
-			CREATE INDEX IF NOT EXISTS idx_user_messages_timestamp_model ON user_messages(timestamp, model, provider);
-		`);
-	} else if (!userMessageColumns.some(column => column.name === "prose")) {
-		// v9 judge prose: the backfill below clears the rows, so defaults are
-		// only placeholders until the re-parse repopulates them.
-		db.run("ALTER TABLE user_messages ADD COLUMN prose TEXT NOT NULL DEFAULT ''");
-		db.run("ALTER TABLE user_messages ADD COLUMN prose_hash TEXT NOT NULL DEFAULT ''");
-	}
-	db.run("CREATE INDEX IF NOT EXISTS idx_user_messages_prose_hash ON user_messages(prose_hash)");
-	backfillUserMessages(db);
-	backfillToolCalls(db);
-	backfillReingestCosts(db);
-	backfillUnpricedCosts(db);
-	repairUserMessageLinks(db);
-	backfillPriorityPremiumRequests(db);
-	backfillAgentType(db);
-	backfillMissingCatalogCosts(db);
-	backfillNoCacheInputCosts(db);
 	backfillForkDuplicates(db);
-	backfillSpotlight(db, SPOTLIGHT_BACKFILL_KEY);
-	reparseSpotlightSessions(db, SPOTLIGHT_EDITS_BACKFILL_KEY);
-	reparseSpotlightSessions(db, SPOTLIGHT_NEEDS_BACKFILL_KEY);
-	reparseSpotlightSessions(db, SPOTLIGHT_ARG_TOKENS_BACKFILL_KEY);
-	backfillSpotlight(db, SPOTLIGHT_TOGGLE_BACKFILL_KEY);
 	ensureRollupSchema(db);
 	return db;
-}
-
-function hasBillableCost(cost: ModelCost): boolean {
-	return cost.input !== 0 || cost.output !== 0 || cost.cacheRead !== 0 || cost.cacheWrite !== 0;
-}
-
-function getBundledModelCost(provider: string, modelId: string): ModelCost | null {
-	const model = getBundledModel(provider as GeneratedProvider, modelId);
-	return model?.cost ?? null;
-}
-
-function getCatalogCost(provider: string, modelId: string): ModelCost | null {
-	const primaryCost = getBundledModelCost(provider, modelId);
-	if (primaryCost && hasBillableCost(primaryCost)) {
-		return primaryCost;
-	}
-
-	// openai-codex has no catalog pricing-peer row (its bundled rows carry
-	// their own prices); keep its first-party fallback here.
-	const peer = pricingPeerFor(provider, modelId);
-	const fallbacks = peer
-		? peer.peers.map(peerProvider => [peerProvider, peer.peerId] as const)
-		: provider === "openai-codex"
-			? [["openai", modelId] as const]
-			: [];
-	for (const [fallbackProvider, fallbackId] of fallbacks) {
-		const fallbackCost = getBundledModelCost(fallbackProvider, fallbackId);
-		if (fallbackCost && hasBillableCost(fallbackCost)) {
-			return fallbackCost;
-		}
-	}
-
-	return null;
-}
-
-/** Whether the catalog prices this model on a time-based (scheduled) card. */
-export function isScheduledCatalogModel(provider: string, modelId: string): boolean {
-	return getCatalogCost(provider, modelId)?.timeBased != null;
-}
-
-function calculateCatalogCost(
-	provider: string,
-	modelId: string,
-	tokens: CostTokens,
-	timestamp: number,
-): UsageCost | null {
-	const cost = getCatalogCost(provider, modelId);
-	if (!cost) return null;
-
-	const orchestration = tokens.orchestration;
-	const usage: Usage = {
-		...tokens,
-		totalTokens:
-			tokens.input +
-			tokens.output +
-			tokens.cacheRead +
-			tokens.cacheWrite +
-			(orchestration?.input ?? 0) +
-			(orchestration?.output ?? 0) +
-			(orchestration?.cacheRead ?? 0),
-		cost: { ...ZERO_USAGE_COST },
-	};
-	return calculateUsageCost(cost, usage, timestamp);
 }
 
 function normalizeUsageCost(cost: Partial<UsageCost>): UsageCost {
@@ -624,226 +257,83 @@ function normalizeUsageCost(cost: Partial<UsageCost>): UsageCost {
 	return { input, output, cacheRead, cacheWrite, total };
 }
 
-/**
- * The parser records no timestamp for an entry that carries neither a numeric
- * message timestamp nor a parseable entry timestamp, leaving this sentinel.
- * Pricing such a request from the clock would bill it as a 1970 request.
- */
-function hasRequestTimestamp(timestamp: number): boolean {
-	return Number.isFinite(timestamp) && timestamp > 0;
-}
-
-interface ResolvedCost {
-	cost: UsageCost;
-	/**
-	 * The stored zero is unknown spend rather than a price: a scheduled card
-	 * with no recoverable request timestamp to select a tariff from. Persisted
-	 * as `cost_unpriced` so the aggregates do not have to infer it.
-	 */
-	unpriced: boolean;
-}
-
-function resolveStoredCost(stats: MessageStatsInput): ResolvedCost {
+function resolveStoredCost(stats: MessageStatsInput, rates: ModelRates | null): EstimatedCost {
 	// `usage.cost` is absent when the session entry recorded no price at all, and
 	// legacy payloads can carry a partially-populated cost object (e.g. only
 	// `total`). The messages table declares every cost_* column as REAL NOT NULL,
 	// so any missing field must be normalised here before binding into SQLite.
 	const raw: Partial<UsageCost> | undefined = stats.usage.cost;
-	const storedCost = raw ? normalizeUsageCost(raw) : undefined;
-	const catalogCost = getCatalogCost(stats.provider, stats.model);
-
-	// Recurring-tariff prices are frozen per request, including explicitly free
-	// usage. Preserve legacy zero-cost subscription correction for other models;
-	// dated rate cards reprice it at the card for the request's timestamp.
-	const recurring = catalogCost?.timeBased !== undefined && hasRecurringTariff(catalogCost.timeBased);
-	if (storedCost && Number.isFinite(storedCost.total) && (storedCost.total !== 0 || recurring)) {
-		return { cost: storedCost, unpriced: false };
+	if (raw) {
+		const storedCost = normalizeUsageCost(raw);
+		// A recorded charge is what the request cost when it ran; keep it as is.
+		if (Number.isFinite(storedCost.total) && storedCost.total > 0) {
+			return { cost: storedCost, unpriced: false, estimated: false };
+		}
 	}
+	// pi records zero for subscription and OAuth usage: price it at the public
+	// rate of the same model, or mark it unpriced when no provider has one.
+	return estimateCost(rates, stats.usage, stats.usage.totalTokens);
+}
 
-	// Without a request timestamp a scheduled card has no tariff to select, and
-	// the epoch would silently become one. Leave the request unpriced; a re-parse
-	// of the session file repairs it once the timestamp is recoverable.
-	if (!hasRequestTimestamp(stats.timestamp) && catalogCost?.timeBased) {
-		return { cost: storedCost ?? ZERO_USAGE_COST, unpriced: true };
+/** Timing the pi extension measured for one assistant request (epoch ms). */
+export interface RequestTiming {
+	requestStart: number;
+	/** Null when the response ended before any token arrived. */
+	firstTokenAt: number | null;
+	endAt: number;
+}
+
+/**
+ * Store (or replace) a live request timing. The triggers in {@link initDb}
+ * copy it onto the request's `messages` row, now or when that row is ingested.
+ * `sessionFile` must be the path the sync stores as `session_file`.
+ */
+export function recordTiming(t: {
+	sessionFile: string;
+	entryId: string;
+	requestStart: number;
+	firstTokenAt: number | null;
+	endAt: number;
+}): void {
+	if (!db) return;
+	db.query(`
+		INSERT INTO timings (session_file, entry_id, request_start, first_token_at, end_at)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(session_file, entry_id) DO UPDATE SET
+			request_start = excluded.request_start,
+			first_token_at = excluded.first_token_at,
+			end_at = excluded.end_at
+	`).run(t.sessionFile, t.entryId, t.requestStart, t.firstTokenAt, t.endAt);
+}
+
+/** Live timings recorded for one transcript, by entry id. */
+export function getSessionTimings(sessionFile: string): Map<string, RequestTiming> {
+	const timings = new Map<string, RequestTiming>();
+	if (!db) return timings;
+	const rows = db
+		.query<{ entry_id: string; request_start: number; first_token_at: number | null; end_at: number }>(
+			"SELECT entry_id, request_start, first_token_at, end_at FROM timings WHERE session_file = ?",
+		)
+		.all(sessionFile);
+	for (const row of rows) {
+		timings.set(row.entry_id, {
+			requestStart: row.request_start,
+			firstTokenAt: row.first_token_at,
+			endAt: row.end_at,
+		});
 	}
-
-	return {
-		cost:
-			calculateCatalogCost(stats.provider, stats.model, stats.usage, stats.timestamp) ??
-			storedCost ??
-			ZERO_USAGE_COST,
-		unpriced: false,
-	};
+	return timings;
 }
 
-function calculateNoCacheInputCost(
-	provider: string,
-	modelId: string,
-	tokens: CostTokens,
-	timestamp: number,
-): number | null {
-	const cost = getCatalogCost(provider, modelId);
-	if (!cost) return null;
-	// Mirrors `resolveStoredCost`: an unpriced scheduled request must not report
-	// its whole prompt as cache savings just because the clock could be read.
-	if (!hasRequestTimestamp(timestamp) && cost.timeBased) return null;
-	const promptInputTokens =
-		tokens.input +
-		tokens.cacheRead +
-		tokens.cacheWrite +
-		(tokens.orchestration?.input ?? 0) +
-		(tokens.orchestration?.cacheRead ?? 0);
-	return calculateUncachedInputCost(cost, promptInputTokens, timestamp);
+/** Read one `meta` value, or null when the key is absent (or before {@link initDb}). */
+export function getMetaValue(key: string): string | null {
+	return db?.query<{ value: string }>("SELECT value FROM meta WHERE key = ?").get(key)?.value ?? null;
 }
 
-function backfillMissingCatalogCosts(database: Database): void {
-	const ran = database.query("SELECT value FROM meta WHERE key = ?").get(CATALOG_COST_BACKFILL_KEY) as
-		| { value: string }
-		| undefined;
-	if (ran?.value === VERSION) return;
-	const markRan = database.query("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)");
-	const rows = database
-		.query(`
-			SELECT id, provider, model, timestamp, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens
-			FROM messages
-			WHERE cost_total = 0 AND total_tokens > 0
-		`)
-		.all() as CostBackfillRow[];
-
-	const update = database.query(`
-		UPDATE messages
-		SET cost_input = ?, cost_output = ?, cost_cache_read = ?, cost_cache_write = ?, cost_total = ?
-		WHERE id = ?
-	`);
-
-	const applyBackfill = database.transaction(() => {
-		for (const row of rows) {
-			// A stored zero cannot distinguish missing historical prices from an
-			// explicitly free request. Never reprice recorded recurring-tariff
-			// usage: a zero ingested for such a card is permanent, because this
-			// backfill skips those rows. Re-parsing the session file is the only
-			// repair, and it works only once the entry's absent `cost` reaches
-			// `resolveStoredCost` as absence rather than as a synthesized zero.
-			// Dated rate cards need the row's timestamp to pick their card.
-			const schedule = getCatalogCost(row.provider, row.model)?.timeBased;
-			if (schedule && (hasRecurringTariff(schedule) || !hasRequestTimestamp(row.timestamp))) continue;
-			const cost = calculateCatalogCost(
-				row.provider,
-				row.model,
-				{
-					input: row.input_tokens,
-					output: row.output_tokens,
-					cacheRead: row.cache_read_tokens,
-					cacheWrite: row.cache_write_tokens,
-				},
-				row.timestamp,
-			);
-
-			if (!cost || cost.total === 0) continue;
-
-			update.run(cost.input, cost.output, cost.cacheRead, cost.cacheWrite, cost.total, row.id);
-		}
-		markRan.run(CATALOG_COST_BACKFILL_KEY, VERSION);
-	});
-
-	applyBackfill();
+export function setMetaValue(key: string, value: string): void {
+	db?.query("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)").run(key, value);
 }
 
-function backfillNoCacheInputCosts(database: Database): void {
-	const row = database.query("SELECT value FROM meta WHERE key = ?").get(NO_CACHE_INPUT_BACKFILL_KEY) as
-		| { value: string }
-		| undefined;
-	if (row?.value === BACKFILL_COMPLETE) return;
-	const markComplete = database.query("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)");
-	const rows = database
-		.query(`
-			SELECT id, provider, model, timestamp, input_tokens, cache_read_tokens, cache_write_tokens
-			FROM messages
-			WHERE cost_no_cache_input IS NULL
-		`)
-		.all() as NoCacheInputCostBackfillRow[];
-
-	const update = database.query("UPDATE messages SET cost_no_cache_input = ? WHERE id = ?");
-	const applyBackfill = database.transaction(() => {
-		for (const row of rows) {
-			const cost = calculateNoCacheInputCost(
-				row.provider,
-				row.model,
-				{
-					input: row.input_tokens,
-					output: 0,
-					cacheRead: row.cache_read_tokens,
-					cacheWrite: row.cache_write_tokens,
-				},
-				row.timestamp,
-			);
-			update.run(cost ?? 0, row.id);
-		}
-		markComplete.run(NO_CACHE_INPUT_BACKFILL_KEY, BACKFILL_COMPLETE);
-	});
-	applyBackfill();
-}
-
-/**
- * Re-parse, once per key, the transcripts that can hold Spotlight entries
- * (modified since {@link SPOTLIGHT_SINCE_MS}) by dropping their cursors; every
- * older cursor stays, so this never triggers a full-history re-parse. The next
- * sync rebuilds those files from byte zero, replacing their Spotlight rows.
- * Keys: {@link SPOTLIGHT_BACKFILL_KEY} (the tables are new),
- * {@link SPOTLIGHT_TOGGLE_BACKFILL_KEY} (the experiment became a toggle).
- */
-function backfillSpotlight(database: Database, key: string): void {
-	const row = database.query<{ value: string }, [string]>("SELECT value FROM meta WHERE key = ?").get(key);
-	if (row?.value === BACKFILL_COMPLETE) return;
-	database.transaction(() => {
-		database.query("DELETE FROM file_offsets WHERE last_modified >= ?").run(SPOTLIGHT_SINCE_MS);
-		database.query("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)").run(key, BACKFILL_COMPLETE);
-	})();
-}
-
-/**
- * Drop the arm columns of a database written while sessions drew arms, once
- * (while `spotlight_sessions.arm` exists). Sessions of any arm but the one that shipped
- * were never shaped with the shipped algorithm: their Spotlight rows go now,
- * so the dashboard leaves them out before the {@link SPOTLIGHT_TOGGLE_BACKFILL_KEY}
- * re-parse (which also clears their parser state) runs.
- */
-function dropSpotlightArms(database: Database): void {
-	const columns = database.query<{ name: string }, []>("PRAGMA table_info(spotlight_sessions)").all();
-	if (!columns.some(column => column.name === "arm")) return;
-	database.transaction(() => {
-		const legacy = "SELECT session_file FROM spotlight_sessions WHERE arm <> 'vylv5'";
-		// `spotlight_sessions` (first in the list) goes last: the other deletes select through it.
-		for (const table of SPOTLIGHT_TABLES.toReversed()) {
-			database.run(`DELETE FROM ${table} WHERE session_file IN (${legacy})`);
-		}
-		for (const column of ["arm", "find_ranker", "source"]) {
-			database.run(`ALTER TABLE spotlight_sessions DROP COLUMN ${column}`);
-		}
-		database.run("ALTER TABLE spotlight_sessions RENAME COLUMN assigned_at TO marked_at");
-		database.run("ALTER TABLE spotlight_results DROP COLUMN arm");
-		// The retired guard-rail comparison cached its history reference here.
-		database.run("DELETE FROM meta WHERE key LIKE 'spotlight_guard_history:%'");
-	})();
-}
-
-/**
- * Re-parse, once per key, every experiment session (the transcripts
- * `spotlight_sessions` names, never the whole history) by dropping their
- * cursors; the next sync rebuilds them from byte zero, replacing their
- * Spotlight rows. Keys: {@link SPOTLIGHT_EDITS_BACKFILL_KEY} (calls get
- * `edits`), {@link SPOTLIGHT_NEEDS_BACKFILL_KEY} (results get heat, kept runs,
- * plain sizes and the score-free flag, shaped reads needed lines),
- * {@link SPOTLIGHT_ARG_TOKENS_BACKFILL_KEY} (calls get argument tokens).
- */
-function reparseSpotlightSessions(database: Database, key: string): void {
-	const row = database.query<{ value: string }, [string]>("SELECT value FROM meta WHERE key = ?").get(key);
-	if (row?.value === BACKFILL_COMPLETE) return;
-	database.transaction(() => {
-		database.run("DELETE FROM file_offsets WHERE session_file IN (SELECT session_file FROM spotlight_sessions)");
-		database.query("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)").run(key, BACKFILL_COMPLETE);
-	})();
-}
 
 /** Persisted transcript identity and parser cursor used to resume stats ingestion. */
 export interface FileOffset {
@@ -1061,9 +551,6 @@ export function applySessionParseResults(sessions: ParsedSession[]): {
 					}
 				}
 				if (replace) {
-					for (const table of SPOTLIGHT_TABLES) {
-						changes += database.query(`DELETE FROM ${table} WHERE session_file = ?`).run(sessionFile).changes;
-					}
 					if (messages.length > 0) {
 						changes += database.query("DELETE FROM messages WHERE session_file = ?").run(sessionFile).changes;
 					}
@@ -1088,14 +575,7 @@ export function applySessionParseResults(sessions: ParsedSession[]): {
 			insertUserMessageStats(parsedRows(writes, result => result.userStats)) +
 			updateUserMessageLinks(parsedRows(writes, result => result.userLinks)) +
 			insertToolCalls(parsedRows(writes, result => result.toolCalls)) +
-			updateToolResults(parsedRows(writes, result => result.toolResults)) +
-			insertSpotlightSessions(parsedRows(writes, result => result.spotlight.sessions)) +
-			updateSpotlightTitles(parsedRows(writes, result => result.spotlight.titles)) +
-			upsertSpotlightShapes(parsedRows(writes, result => result.spotlight.shapes)) +
-			insertSpotlightCalls(parsedRows(writes, result => result.spotlight.calls)) +
-			updateSpotlightCallResults(parsedRows(writes, result => result.spotlight.callResults)) +
-			insertSpotlightRequests(parsedRows(writes, result => result.spotlight.requests)) +
-			upsertSpotlightNeeds(parsedRows(writes, result => result.spotlight.needs));
+			updateToolResults(parsedRows(writes, result => result.toolResults));
 		for (const { sessionFile, result } of sessions) {
 			if (result.parserState) {
 				setFileOffset(sessionFile, result.newOffset, result.parserState.mtimeMs, result.parserState);
@@ -1110,7 +590,7 @@ export function applySessionParseResults(sessions: ParsedSession[]): {
 
 /**
  * SQLite `PRAGMA data_version` of the open connection, or null before
- * {@link initDb}. It moves only when another connection (another omp process)
+ * {@link initDb}. It moves only when another connection (another pi process)
  * commits, so a caller can detect foreign writes without scanning.
  */
 export function getDataVersion(): number | null {
@@ -1129,18 +609,17 @@ export function completeSessionSync(reconcile: boolean): void {
 /**
  * Insert message stats into the database.
  *
- * Forked / branched sessions (see `SessionManager.fork()` and
- * `createBranchedSession()` in `@oh-my-pi/pi-coding-agent`) deep-copy a parent
+ * Forked / branched sessions (see `SessionManager.forkFrom()` and
+ * `createBranchedSession()` in `@earendil-works/pi-coding-agent`) copy a parent
  * session's entries into a new JSONL — same `entry_id`, `timestamp`, `model`,
- * `provider`, token counts, and `responseId`. The `UNIQUE(session_file,
- * entry_id)` constraint alone keys each row by file, so without the guard
+ * `provider` and token counts. The `UNIQUE(session_file, entry_id)`
+ * constraint alone keys each row by file, so without the guard
  * below the same provider request would land twice and inflate every
  * aggregate. The {@link ChunkedInsert} fork guard skips inserts whose
  * `(entry_id, timestamp)` already exists under a different `session_file` —
  * first-write-wins across the lineage. Same-file re-syncs still hit the
  * `ON CONFLICT(session_file, entry_id)` upsert below, which re-derives the
- * stored cost (orchestration-aware) and keeps `premium_requests` monotonic, so
- * a forced re-parse repairs historical `premium_requests` and cost fix-ups.
+ * stored cost from the current rate card.
  */
 export function insertMessageStats(stats: Iterable<MessageStatsInput>): number {
 	if (!db) return 0;
@@ -1163,8 +642,8 @@ export function insertMessageStats(stats: Iterable<MessageStatsInput>): number {
 			"output_tokens",
 			"cache_read_tokens",
 			"cache_write_tokens",
+			"cache_write_1h_tokens",
 			"total_tokens",
-			"premium_requests",
 			"cost_input",
 			"cost_output",
 			"cost_cache_read",
@@ -1172,12 +651,11 @@ export function insertMessageStats(stats: Iterable<MessageStatsInput>): number {
 			"cost_total",
 			"cost_no_cache_input",
 			"cost_unpriced",
+			"cost_estimated",
 			"agent_type",
-			"service_tier",
 		],
 		identity: ["entry_id", "timestamp"],
 		upsert: `ON CONFLICT(session_file, entry_id) DO UPDATE SET
-			premium_requests = MAX(messages.premium_requests, excluded.premium_requests),
 			cost_input = excluded.cost_input,
 			cost_output = excluded.cost_output,
 			cost_cache_read = excluded.cost_cache_read,
@@ -1185,12 +663,13 @@ export function insertMessageStats(stats: Iterable<MessageStatsInput>): number {
 			cost_total = excluded.cost_total,
 			cost_no_cache_input = excluded.cost_no_cache_input,
 			cost_unpriced = excluded.cost_unpriced,
-			service_tier = excluded.service_tier`,
+			cost_estimated = excluded.cost_estimated`,
 	});
+	const ratesOf = createRateLookup(db);
 	return atomically(db, () => {
 		for (const s of stats) {
-			const { cost, unpriced } = resolveStoredCost(s);
-			const noCacheInputCost = calculateNoCacheInputCost(s.provider, s.model, s.usage, s.timestamp) ?? 0;
+			const rates = ratesOf(s.provider, s.model);
+			const { cost, unpriced, estimated } = resolveStoredCost(s, rates);
 			writer.add(
 				s.sessionFile,
 				[s.entryId, s.timestamp],
@@ -1210,17 +689,17 @@ export function insertMessageStats(stats: Iterable<MessageStatsInput>): number {
 					s.usage.output,
 					s.usage.cacheRead,
 					s.usage.cacheWrite,
+					s.usage.cacheWrite1h ?? 0,
 					s.usage.totalTokens,
-					s.usage.premiumRequests ?? 0,
 					cost.input,
 					cost.output,
 					cost.cacheRead,
 					cost.cacheWrite,
 					cost.total,
-					noCacheInputCost,
+					uncachedInputCost(rates, s.usage),
 					unpriced ? 1 : 0,
+					estimated ? 1 : 0,
 					s.agentType,
-					s.serviceTier ?? null,
 				],
 			);
 		}
@@ -1248,7 +727,34 @@ export function closeDb(): void {
 	}
 }
 
-function rowToMessageStats(row: any): MessageStats {
+interface MessageRow {
+	id: number;
+	session_file: string;
+	entry_id: string;
+	folder: string;
+	model: string;
+	provider: string;
+	api: string;
+	timestamp: number;
+	duration: number | null;
+	ttft: number | null;
+	stop_reason: MessageStats["stopReason"];
+	error_message: string | null;
+	input_tokens: number;
+	output_tokens: number;
+	cache_read_tokens: number;
+	cache_write_tokens: number;
+	total_tokens: number;
+	cost_input: number;
+	cost_output: number;
+	cost_cache_read: number;
+	cost_cache_write: number;
+	cost_total: number;
+	cost_unpriced: number;
+	agent_type: AgentType;
+}
+
+function rowToMessageStats(row: MessageRow): MessageStats {
 	return {
 		id: row.id,
 		sessionFile: row.session_file,
@@ -1260,7 +766,7 @@ function rowToMessageStats(row: any): MessageStats {
 		timestamp: row.timestamp,
 		duration: row.duration,
 		ttft: row.ttft,
-		stopReason: row.stop_reason as any,
+		stopReason: row.stop_reason,
 		errorMessage: row.error_message,
 		usage: {
 			input: row.input_tokens,
@@ -1268,7 +774,6 @@ function rowToMessageStats(row: any): MessageStats {
 			cacheRead: row.cache_read_tokens,
 			cacheWrite: row.cache_write_tokens,
 			totalTokens: row.total_tokens,
-			premiumRequests: row.premium_requests ?? 0,
 			cost: {
 				input: row.cost_input,
 				output: row.cost_output,
@@ -1277,26 +782,25 @@ function rowToMessageStats(row: any): MessageStats {
 				total: row.cost_total,
 			},
 		},
-		agentType: (row.agent_type as AgentType) ?? "main",
-		serviceTier: (row.service_tier as ServiceTier | null) ?? null,
+		agentType: row.agent_type,
 		costUnpriced: row.cost_unpriced === 1,
 	};
 }
 
 export function getRecentRequests(limit = 100): MessageStats[] {
 	if (!db) return [];
-	const stmt = db.query(`
+	const stmt = db.query<MessageRow>(`
 		SELECT * FROM messages 
 		ORDER BY timestamp DESC 
 		LIMIT ?
 	`);
-	return (stmt.all(limit) as any[]).map(rowToMessageStats);
+	return stmt.all(limit).map(rowToMessageStats);
 }
 
 export function getRecentErrors(limit = 100, cutoff?: number | null): MessageStats[] {
 	if (!db) return [];
 	const hasCutoff = cutoff !== undefined && cutoff !== null;
-	const stmt = db.query(`
+	const stmt = db.query<MessageRow>(`
 		SELECT * FROM messages
 		WHERE stop_reason = 'error'
 		${hasCutoff ? "AND timestamp >= ?" : ""}
@@ -1309,14 +813,15 @@ export function getRecentErrors(limit = 100, cutoff?: number | null): MessageSta
 
 export function getMessageById(id: number): MessageStats | null {
 	if (!db) return null;
-	const stmt = db.query("SELECT * FROM messages WHERE id = ?");
+	const stmt = db.query<MessageRow>("SELECT * FROM messages WHERE id = ?");
 	const row = stmt.get(id);
 	return row ? rowToMessageStats(row) : null;
 }
+
 /**
  * Per-local-day activity aggregates for the last `days` days, oldest first.
- * Self-initializing (opens the stats DB on first use) so the coding-agent TUI
- * can query without the dashboard server's init flow. Days use the machine's
+ * Self-initializing (opens the stats DB on first use) so a caller can query
+ * without the dashboard server's init flow. Days use the machine's
  * timezone — this is a localhost tool, same rationale as
  * {@link getProviderHourlyBurn}. Reads the hourly rollup, falling back to the
  * raw rows while its rebuild backlog is too large for exact reads.
@@ -1352,177 +857,20 @@ export async function getDailyActivity(days = 371): Promise<DailyActivityPoint[]
 }
 
 /**
- * Reset `file_offsets` (and any existing `user_messages` rows) so the next
- * successful sync re-parses every session and re-derives behavioral metrics.
- * Run once per metric-definition bump; the meta sentinel is only marked
- * complete after `syncAllSessions` finishes. Older timestamp sentinel values
- * are treated as pending so a failed compiled-binary sync cannot permanently
- * suppress the backfill.
- *
- * - v1: initial introduction of `user_messages`.
- * - v2: yelling-sentence metric replaces caps-word counts; existing rows are
- *   computed under the old definition and must be discarded.
- * - v3: drama runs collapsed into `anguish` (drama + elongated interjections
- *   + `dude` + dot runs), scored on a stripped prose body and gated on
- *   line count. Existing rows used the narrower definition.
- * - v4: added `negation` / `repetition` / `blame` signals and fixed a
- *   latent word-boundary bug in the profanity / anguish regexes that had
- *   left those metrics matching nothing in real prose.
- * - v5: renamed `yelling_sentences` column to `yelling` to match the other
- *   single-word signal columns (profanity, anguish, negation, ...).
- * - v6: dropped `git` from the profanity word list - it collided with the
- *   version-control tool name, so existing rows over-counted profanity.
- * - v7: false-positive trim measured against the real corpus: dot runs
- *   (`..`/`...`) no longer count as anguish; profanity list dropped
- *   technical-collision words (`dummy`, `blast`, `knob`, `trash`, `crud`,
- *   `garbage`, ...), opinion/dislike words (`useless`, `awful`, `hate`,
- *   `meh`, ...) and moved `ugh`/`argh`/`grr` interjections to anguish;
- *   yelling now requires multi-word caps (filenames like `AGENTS.md` no
- *   longer fragment into all-caps sentences); bare leading `no` only
- *   counts as negation when used as an interjection, not a determiner.
- * - v8: `no-op`-style compounds no longer count as corrective negation
- *   (hyphen after bare `no` only counts as a separator when it isn't
- *   gluing a compound word), and three measured false-negative clusters
- *   were recovered: sad emoticons (`:(`) score anguish, `why (would|did)
- *   you` scores blame, `makes (no|zero) sense` scores negation. v7
- *   shipped briefly without these, so any database that completed the v7
- *   backfill needs one more re-derive.
- * - v9: stored judge prose (`prose` / `prose_hash`) for the frustration
- *   judge, so every session re-parses once to populate it. Verdicts live in
- *   `frustration_verdicts`, keyed by prose hash, which this reset never touches.
- * - v10: excluded agent-attributed user-role messages, which diluted user
- *   frustration rates and could be judged as user complaints.
- *
- * Existing `messages` rows are unaffected - `INSERT OR IGNORE` keeps them.
- */
-function backfillUserMessages(database: Database): void {
-	const row = database.query("SELECT value FROM meta WHERE key = ?").get(USER_MESSAGES_BACKFILL_KEY) as
-		| { value: string }
-		| undefined;
-	if (!shouldResetBackfill(row?.value)) return;
-
-	database.run("DELETE FROM user_messages");
-	database.run("DELETE FROM file_offsets");
-	database
-		.query("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)")
-		.run(USER_MESSAGES_BACKFILL_KEY, BACKFILL_PENDING);
-}
-
-/**
- * One-shot wipe of `tool_calls` + `file_offsets` when the `tool_calls` table
- * is introduced (or its schema version bumps), so the next sync re-parses
- * every session and ingests historical tool calls. `messages` and
- * `user_messages` re-inserts are idempotent, so the offset reset is safe.
- * Same sentinel protocol as {@link backfillUserMessages}: the PENDING value
- * written here prevents re-wiping on subsequent inits.
- */
-function backfillToolCalls(database: Database): void {
-	const row = database.query("SELECT value FROM meta WHERE key = ?").get(TOOL_CALLS_BACKFILL_KEY) as
-		| { value: string }
-		| undefined;
-	if (!shouldResetBackfill(row?.value)) return;
-
-	database.run("DELETE FROM tool_calls");
-	database.run("DELETE FROM file_offsets");
-	database
-		.query("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)")
-		.run(TOOL_CALLS_BACKFILL_KEY, BACKFILL_PENDING);
-}
-
-/**
- * One-shot `file_offsets` wipe so the next sync re-parses every session and
- * re-prices `messages` from source. Pre-fix ingests priced subscription rows
- * from the four stored token buckets only, dropping `Usage.orchestration`
- * (never a stored column), so multi-agent Grok and any other orchestration-
- * billed model were understated and could not reach the inclusive 200K tier.
- * The re-parse reruns the orchestration-aware pricing in `resolveStoredCost`
- * and the cost-refreshing UPSERT in {@link insertMessageStats} writes it back.
- * `messages`/`user_messages`/`tool_calls` re-inserts are idempotent, so the
- * offset reset is safe. Same sentinel protocol as {@link backfillToolCalls}.
- */
-function backfillReingestCosts(database: Database): void {
-	const row = database.query("SELECT value FROM meta WHERE key = ?").get(COST_REINGEST_BACKFILL_KEY) as
-		| { value: string }
-		| undefined;
-	if (!shouldResetBackfill(row?.value)) return;
-
-	database.run("DELETE FROM file_offsets");
-	database
-		.query("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)")
-		.run(COST_REINGEST_BACKFILL_KEY, BACKFILL_PENDING);
-}
-
-/**
- * One-shot `file_offsets` wipe so the next sync re-parses every session and
- * re-derives `cost_unpriced` from `resolveStoredCost`. Rows ingested before the
- * marker existed defaulted to 0, and `INSERT ... ON CONFLICT DO UPDATE` only
- * refreshes them when the session is re-parsed — which the spent reingest
- * sentinel above will never do again. The re-parse also re-prices the
- * previously absent legacy `cost` charges, since `resolveStoredCost` now reads
- * absence as absence. Same sentinel protocol as {@link backfillReingestCosts}.
- */
-function backfillUnpricedCosts(database: Database): void {
-	const row = database.query("SELECT value FROM meta WHERE key = ?").get(COST_UNPRICED_BACKFILL_KEY) as
-		| { value: string }
-		| undefined;
-	if (!shouldResetBackfill(row?.value)) return;
-
-	database.run("DELETE FROM file_offsets");
-	database
-		.query("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)")
-		.run(COST_UNPRICED_BACKFILL_KEY, BACKFILL_PENDING);
-}
-
-/**
- * Reclassify pre-existing `messages` rows by agent type once, after the
- * `agent_type` column is added to an older database (every prior row defaulted
- * to 'main' on the ALTER). Classification is purely path-based — derived from
- * the stored `session_file` — so no session re-parse is needed. Idempotent and
- * crash-safe: enrolled (PENDING) only at migration time in {@link initDb} and
- * marked COMPLETE inside the same transaction that applies the updates, so an
- * interrupted run rolls back and retries on the next init.
- */
-function backfillAgentType(database: Database): void {
-	const row = database.query("SELECT value FROM meta WHERE key = ?").get(AGENT_TYPE_BACKFILL_KEY) as
-		| { value: string }
-		| undefined;
-	if (row?.value !== BACKFILL_PENDING) return;
-
-	const sessionFiles = database.query("SELECT DISTINCT session_file FROM messages").all() as {
-		session_file: string;
-	}[];
-	const update = database.query("UPDATE messages SET agent_type = ? WHERE session_file = ?");
-	const markComplete = database.query("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)");
-	const apply = database.transaction(() => {
-		for (const { session_file } of sessionFiles) {
-			const agentType = classifyAgentType(session_file);
-			// Rows already default to 'main'; only the nested transcripts move.
-			if (agentType !== "main") update.run(agentType, session_file);
-		}
-		markComplete.run(AGENT_TYPE_BACKFILL_KEY, BACKFILL_COMPLETE);
-	});
-	apply();
-}
-
-/**
- * One-shot collapse of forked-session duplicates that landed under the old
- * `UNIQUE(session_file, entry_id)`-only invariant. `SessionManager.fork()`
- * and `createBranchedSession()` deep-copy a parent's entries into the new
- * JSONL — same `entry_id`, `timestamp`, `model`, `responseId`, token counts,
- * cost — and the previous insert path counted both files toward request /
+ * One-shot collapse of forked-session duplicates stored without the fork
+ * guard, under the `UNIQUE(session_file, entry_id)`-only invariant.
+ * `SessionManager.forkFrom()` and `createBranchedSession()` copy a parent's
+ * entries into the new JSONL — same `entry_id`, `timestamp`, `model`, token
+ * counts, cost — and an unguarded insert counts both files toward request /
  * token / cost totals. The migration keeps the lowest-`id` row per
- * `(entry_id, timestamp)` group (almost always the parent — sessions are
- * filename-timestamped and sync processes them in name order, so the
- * originating file lands first) and drops every other copy. Same fix on
+ * `(entry_id, timestamp)` group and drops every other copy. Same fix on
  * `user_messages` since forks copy user entries too. Idempotent and
- * crash-safe: enrolled at module-load via the `meta` sentinel, marked
+ * crash-safe: enrolled through the `meta` sentinel, marked
  * COMPLETE inside the same transaction so an aborted run rolls back and
  * retries on the next init.
  */
 function backfillForkDuplicates(database: Database): void {
-	const row = database.query("SELECT value FROM meta WHERE key = ?").get(FORK_DEDUPE_KEY) as
-		| { value: string }
-		| undefined;
+	const row = database.query<{ value: string }>("SELECT value FROM meta WHERE key = ?").get(FORK_DEDUPE_KEY);
 	if (row?.value === BACKFILL_COMPLETE) return;
 
 	const markComplete = database.query("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)");
@@ -1540,69 +888,6 @@ function backfillForkDuplicates(database: Database): void {
 			)
 		`);
 		markComplete.run(FORK_DEDUPE_KEY, BACKFILL_COMPLETE);
-	});
-	apply();
-}
-
-/**
- * Re-parse, once, every session holding a user message without a responding
- * model, by dropping its cursor; the next sync re-reads it from byte zero and
- * the guarded `updateUserMessageLinks` UPDATE fills each row whose reply is now
- * found. Every other cursor stays, so this never re-parses the whole history.
- */
-function repairUserMessageLinks(database: Database): void {
-	const row = database
-		.query<{ value: string }, [string]>("SELECT value FROM meta WHERE key = ?")
-		.get(USER_MESSAGE_LINKS_REPAIR_KEY);
-	if (row?.value === BACKFILL_COMPLETE) return;
-	database.transaction(() => {
-		database.run(
-			"DELETE FROM file_offsets WHERE session_file IN (SELECT session_file FROM user_messages WHERE model IS NULL)",
-		);
-		database
-			.query("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)")
-			.run(USER_MESSAGE_LINKS_REPAIR_KEY, BACKFILL_COMPLETE);
-	})();
-}
-
-/**
- * One-shot wipe of `file_offsets` so the next sync re-parses every session
- * and re-derives `premium_requests` from recorded `service_tier_change`
- * entries. Earlier ingestions captured priority OpenAI traffic with
- * `premium_requests = 0` because the AI layer only set the field for GitHub
- * Copilot traffic. The parser now folds priority requests into the same
- * counter; combined with the UPSERT in `insertMessageStats`, a single sync
- * pass brings the messages table up to date without touching any other
- * column. Idempotent: gated by a sentinel row in `meta`.
- */
-function backfillPriorityPremiumRequests(database: Database): void {
-	const row = database.query("SELECT value FROM meta WHERE key = ?").get(PRIORITY_PREMIUM_REQUESTS_BACKFILL_KEY) as
-		| { value: string }
-		| undefined;
-	if (!shouldResetBackfill(row?.value)) return;
-
-	database.run("DELETE FROM file_offsets");
-	database
-		.query("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)")
-		.run(PRIORITY_PREMIUM_REQUESTS_BACKFILL_KEY, BACKFILL_PENDING);
-}
-
-/**
- * Settle every full-session backfill after a successful sync pass.
- */
-export function markSessionBackfillsComplete(): void {
-	if (!db) return;
-	const markComplete = db.query("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)");
-	const apply = db.transaction(() => {
-		for (const key of [
-			USER_MESSAGES_BACKFILL_KEY,
-			TOOL_CALLS_BACKFILL_KEY,
-			PRIORITY_PREMIUM_REQUESTS_BACKFILL_KEY,
-			COST_REINGEST_BACKFILL_KEY,
-			COST_UNPRICED_BACKFILL_KEY,
-		]) {
-			markComplete.run(key, BACKFILL_COMPLETE);
-		}
 	});
 	apply();
 }
@@ -1933,263 +1218,4 @@ export function updateToolResults(links: Iterable<ToolResultLink>): number {
 		}
 	});
 	return updated;
-}
-
-/** Tables the parser fills for the Spotlight dashboard, all keyed by `session_file`. */
-const SPOTLIGHT_TABLES = [
-	"spotlight_sessions",
-	"spotlight_results",
-	"spotlight_calls",
-	"spotlight_requests",
-	"spotlight_needs",
-] as const;
-
-/** Record each experiment session's first Spotlight marker; a later one (a resumed session) never replaces it. */
-export function insertSpotlightSessions(rows: Iterable<SpotlightSessionRow>): number {
-	if (!db) return 0;
-	const stmt = db.query(`
-		INSERT OR IGNORE INTO spotlight_sessions (session_file, folder, marked_at, cwd, title)
-		VALUES (?, ?, ?, ?, ?)
-	`);
-	let changes = 0;
-	atomically(db, () => {
-		for (const r of rows) {
-			changes += stmt.run(r.sessionFile, r.folder, r.markedAt, r.cwd, r.title).changes;
-		}
-	});
-	return changes;
-}
-
-export function updateSpotlightTitles(rows: Iterable<{ sessionFile: string; title: string }>): number {
-	if (!db) return 0;
-	const stmt = db.query("UPDATE spotlight_sessions SET title = ? WHERE session_file = ?");
-	let changes = 0;
-	atomically(db, () => {
-		for (const r of rows) changes += stmt.run(r.title, r.sessionFile).changes;
-	});
-	return changes;
-}
-
-/**
- * Upsert evaluated results. The shape entry and the result message can land in
- * different tail parses: the shape entry brings Spotlight's usage and timing,
- * the result's details the hidden lines and named artifacts, and either may
- * come first. Fork copies of a call (same tool call id under another
- * transcript) are skipped, first writer wins.
- */
-export function upsertSpotlightShapes(rows: Iterable<SpotlightShapeRow>): number {
-	if (!db) return 0;
-	const fromDetails = (column: string) =>
-		`${column} = CASE WHEN excluded.has_details = 1 THEN excluded.${column} ELSE spotlight_results.${column} END`;
-	const coalesce = (column: string) => `${column} = COALESCE(excluded.${column}, spotlight_results.${column})`;
-	const writer = new ChunkedInsert(db, {
-		verb: "INSERT",
-		table: "spotlight_results",
-		columns: [
-			"session_file",
-			"tool_call_id",
-			"timestamp",
-			"tool",
-			"in_chars",
-			"out_chars",
-			"in_tokens",
-			"out_tokens",
-			"steps",
-			"has_details",
-			"holdout",
-			"original_url",
-			"path",
-			"start_line",
-			"lines",
-			"hidden",
-			"hidden_lines",
-			"artifacts",
-			"sp_calls",
-			"sp_failures",
-			"sp_failure_causes",
-			"sp_ms",
-			"sp_cost",
-			"shape_ms",
-			"plain_chars",
-			"plain_tokens",
-			"capped_tokens",
-			"score_free",
-			"heat",
-			"kept",
-			"gated",
-			"windows",
-		],
-		identity: ["tool_call_id"],
-		upsert: `ON CONFLICT(session_file, tool_call_id) DO UPDATE SET
-			${["tool", "in_chars", "out_chars", "in_tokens", "out_tokens", "steps", "hidden_lines"].map(fromDetails).join(",\n")},
-			${["original_url", "path", "start_line", "lines", "hidden", "artifacts", "sp_calls", "sp_failures", "sp_failure_causes", "sp_ms", "sp_cost", "shape_ms", "plain_chars", "plain_tokens", "capped_tokens", "heat", "kept", "windows"].map(coalesce).join(",\n")},
-			has_details = MAX(spotlight_results.has_details, excluded.has_details),
-			holdout = MAX(spotlight_results.holdout, excluded.holdout),
-			score_free = MAX(spotlight_results.score_free, excluded.score_free),
-			gated = MAX(spotlight_results.gated, excluded.gated)`,
-	});
-	return atomically(db, () => {
-		for (const r of rows) {
-			const o = r.original;
-			writer.add(
-				r.sessionFile,
-				[r.toolCallId],
-				[
-					r.sessionFile,
-					r.toolCallId,
-					r.timestamp,
-					r.tool,
-					r.inChars,
-					r.outChars,
-					r.inTokens,
-					r.outTokens,
-					JSON.stringify(r.steps),
-					r.hasDetails ? 1 : 0,
-					r.holdout ? 1 : 0,
-					o?.url ?? null,
-					o?.path ?? null,
-					o ? o.start : null,
-					o ? o.lines : null,
-					o ? JSON.stringify(o.hidden) : null,
-					o?.hiddenLines ?? 0,
-					r.artifacts ? JSON.stringify(r.artifacts) : null,
-					r.spotlight?.calls ?? null,
-					r.spotlight?.failures ?? null,
-					r.spotlight?.failureCauses ? JSON.stringify(r.spotlight.failureCauses) : null,
-					r.spotlight?.ms ?? null,
-					r.spotlight?.costUsd ?? null,
-					r.shapeMs,
-					r.plainChars,
-					r.plainTokens,
-					r.cappedTokens,
-					r.scoreFree ? 1 : 0,
-					o?.heat ?? null,
-					o ? JSON.stringify(o.kept) : null,
-					r.gated ? 1 : 0,
-					o && o.windows.length > 1 ? JSON.stringify(o.windows) : null,
-				],
-			);
-		}
-		return writer.finish();
-	});
-}
-
-/**
- * Merge needed lines of shaped reads: ranges add to the stored ones (a tail parse brings only its own calls'),
- * `open` takes the latest. A fork's copy of another transcript's read is skipped, first writer wins.
- */
-export function upsertSpotlightNeeds(rows: Iterable<SpotlightNeedRow>): number {
-	if (!db) return 0;
-	const database = db;
-	const claimed = database.query<{ one: number }, [string, string]>(
-		"SELECT 1 AS one FROM spotlight_needs WHERE tool_call_id = ? AND session_file <> ? LIMIT 1",
-	);
-	const stored = database.query<{ file: string; reread: string; edit: string }, [string, string]>(
-		"SELECT file, reread, edit FROM spotlight_needs WHERE session_file = ? AND tool_call_id = ?",
-	);
-	const write = database.query(
-		"INSERT OR REPLACE INTO spotlight_needs (session_file, tool_call_id, file, open, reread, edit) VALUES (?, ?, ?, ?, ?, ?)",
-	);
-	const ranges = (json: string | undefined): [number, number][] => {
-		if (!json) return [];
-		const value: unknown = JSON.parse(json);
-		return Array.isArray(value)
-			? value.filter(
-					(pair): pair is [number, number] =>
-						Array.isArray(pair) && typeof pair[0] === "number" && typeof pair[1] === "number",
-				)
-			: [];
-	};
-	let changes = 0;
-	atomically(database, () => {
-		for (const r of rows) {
-			if (claimed.get(r.toolCallId, r.sessionFile)) continue;
-			const old = stored.get(r.sessionFile, r.toolCallId);
-			changes += write.run(
-				r.sessionFile,
-				r.toolCallId,
-				// A list read's later parse may first touch another window: the stored file stays.
-				old?.file ?? r.file,
-				r.open ? 1 : 0,
-				JSON.stringify(mergeRanges([...ranges(old?.reread), ...r.reread])),
-				JSON.stringify(mergeRanges([...ranges(old?.edit), ...r.edit])),
-			).changes;
-		}
-	});
-	return changes;
-}
-
-/** Insert experiment-session tool calls; fork copies are skipped as for `tool_calls`. */
-export function insertSpotlightCalls(rows: Iterable<SpotlightCallRow>): number {
-	if (!db) return 0;
-	const writer = new ChunkedInsert(db, {
-		verb: "INSERT OR IGNORE",
-		table: "spotlight_calls",
-		columns: [
-			"session_file",
-			"tool_call_id",
-			"entry_id",
-			"timestamp",
-			"seq",
-			"tool_name",
-			"calls_in_turn",
-			"target",
-			"edits",
-			"arg_tokens",
-		],
-		identity: ["entry_id", "timestamp", "tool_call_id"],
-	});
-	return atomically(db, () => {
-		for (const r of rows) {
-			writer.add(
-				r.sessionFile,
-				[r.entryId, r.timestamp, r.toolCallId],
-				[
-					r.sessionFile,
-					r.toolCallId,
-					r.entryId,
-					r.timestamp,
-					r.seq,
-					r.toolName,
-					r.callsInTurn,
-					r.target,
-					r.edits ? JSON.stringify(r.edits) : null,
-					r.argTokens ? JSON.stringify(r.argTokens) : null,
-				],
-			);
-		}
-		return writer.finish();
-	});
-}
-
-/** Attach result size and named artifacts to recorded calls (results can land in a later tail parse). */
-export function updateSpotlightCallResults(links: Iterable<SpotlightCallResultLink>): number {
-	if (!db) return 0;
-	const stmt = db.query(`
-		UPDATE spotlight_calls SET result_chars = ?, artifacts = ?
-		WHERE session_file = ? AND tool_call_id = ? AND result_chars IS NULL
-	`);
-	let changes = 0;
-	atomically(db, () => {
-		for (const l of links) {
-			changes += stmt.run(l.resultChars, JSON.stringify(l.artifacts), l.sessionFile, l.toolCallId).changes;
-		}
-	});
-	return changes;
-}
-
-/** Insert experiment-session main-loop requests; fork copies are skipped as for `messages`. */
-export function insertSpotlightRequests(rows: Iterable<SpotlightRequestRow>): number {
-	if (!db) return 0;
-	const writer = new ChunkedInsert(db, {
-		verb: "INSERT OR IGNORE",
-		table: "spotlight_requests",
-		columns: ["session_file", "entry_id", "timestamp"],
-		identity: ["entry_id", "timestamp"],
-	});
-	return atomically(db, () => {
-		for (const r of rows)
-			writer.add(r.sessionFile, [r.entryId, r.timestamp], [r.sessionFile, r.entryId, r.timestamp]);
-		return writer.finish();
-	});
 }

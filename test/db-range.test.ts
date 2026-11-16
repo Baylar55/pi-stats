@@ -1,7 +1,7 @@
-import { describe, expect, it } from "bun:test";
-import { getDashboardStats, getFolderStats } from "@oh-my-pi/omp-stats/aggregator";
-import { initDb, insertMessageStats } from "@oh-my-pi/omp-stats/db";
-import type { MessageStats } from "@oh-my-pi/omp-stats/types";
+import { describe, expect, it } from "vitest";
+import { getDashboardStats, getFolderStats } from "../src/aggregator";
+import { initDb, insertMessageStats } from "../src/db";
+import type { MessageStats } from "../src/types";
 import { installStatsTestIsolation } from "./helpers/temp-agent";
 
 installStatsTestIsolation("@pi-stats-db-range-");
