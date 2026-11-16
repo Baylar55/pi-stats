@@ -24,6 +24,9 @@ const TOOL_NAME_PATTERN = /^[\w.:-]+$/;
 /** Provider/model/api of usage no model can be named for. */
 const UNKNOWN = "unknown";
 
+/** Characters of the first user message kept as an unnamed session's title. */
+const TITLE_MAX = 80;
+
 /**
  * Classify which agent produced a transcript from its path below its session
  * root. `<root>/<project>/<file>.jsonl` (or `<root>/<file>.jsonl` in a custom,
@@ -229,8 +232,8 @@ function extractUsageStats(
 		provider,
 		api,
 		timestamp: source.timestamp,
-		// pi records the request duration on newer messages only, and never a time to
-		// first token: both stay NULL until a live timing fills them (see `timings`).
+		// pi never records a time to first token: it stays NULL until a live timing
+		// fills it (see `timings`). The duration is recorded or derived, see `requestDuration`.
 		duration: source.duration,
 		ttft: null,
 		stopReason: source.stopReason,
@@ -238,6 +241,21 @@ function extractUsageStats(
 		usage,
 		agentType,
 	};
+}
+
+/**
+ * How long an assistant response took, in ms. Newer pi versions record it as
+ * `durationMs`. Older messages still carry both ends: `message.timestamp` is
+ * when the request started and the entry's own timestamp is when pi persisted
+ * the finished message, so their difference is the same duration (they agree
+ * with `durationMs` to within a few ms wherever both exist). Null when either
+ * end is missing or they are out of order.
+ */
+export function requestDuration(msg: { durationMs?: unknown; timestamp?: unknown }, entryTimestamp: unknown): number | null {
+	if (isFiniteCount(msg.durationMs) && msg.durationMs >= 0) return msg.durationMs;
+	if (!isFiniteCount(msg.timestamp) || msg.timestamp <= 0 || typeof entryTimestamp !== "string") return null;
+	const persistedAt = Date.parse(entryTimestamp);
+	return Number.isFinite(persistedAt) && persistedAt >= msg.timestamp ? persistedAt - msg.timestamp : null;
 }
 
 /** Message timestamp, falling back to the entry's ISO timestamp, then 0. */
@@ -524,6 +542,10 @@ export interface SessionParserState {
 	model: CurrentModel | null;
 	/** Last entry id before the cursor: the parent of an id-less (v1) entry that follows. */
 	lastId: string | null;
+	/** Name given with `/name`; null when unset. With `firstPrompt`, the session's title in the Traces list. */
+	sessionName: string | null;
+	/** Head of the first user message, the title of an unnamed session (as in pi's `/resume`). */
+	firstPrompt: string | null;
 	pendingReplies: Record<string, string>;
 }
 
@@ -582,6 +604,8 @@ export async function parseSessionFile(
 	// First call per id: the row `INSERT OR IGNORE` keeps, so it can be written with its result.
 	const callsById = new Map<string, ToolCallStats>();
 	let headerFolder: string | null = null;
+	let sessionName: string | null = null;
+	let firstPrompt: string | null = null;
 	let folder = "";
 	let currentModel: CurrentModel | null = null;
 	let replies = new ReplyTracker();
@@ -598,6 +622,12 @@ export async function parseSessionFile(
 				currentModel = { provider: entry.provider, model: entry.modelId, api: currentModel?.api ?? UNKNOWN };
 			}
 		}
+		if (entry.type === "session_info" && "name" in entry) {
+			sessionName = typeof entry.name === "string" && entry.name.trim() ? entry.name.trim() : null;
+		} else if (firstPrompt === null && isMessageEntry(entry) && entry.message.role === "user") {
+			const text = extractUserText("content" in entry.message ? entry.message.content : undefined).trim();
+			if (text) firstPrompt = text.replace(/\s+/g, " ").slice(0, TITLE_MAX);
+		}
 		return replies.visit(entry);
 	};
 
@@ -607,7 +637,7 @@ export async function parseSessionFile(
 	};
 
 	/** Usage of an entry that names no model of its own: attributed to the model in use. */
-	const sideUsage = (entryId: string, usage: unknown, timestamp: number, duration: number | null): void => {
+	const sideUsage = (entryId: string, usage: unknown, timestamp: number): void => {
 		if (!usage || typeof usage !== "object") return;
 		usageRow({
 			entryId,
@@ -616,7 +646,8 @@ export async function parseSessionFile(
 			api: currentModel?.api ?? UNKNOWN,
 			usage,
 			timestamp,
-			duration,
+			// How long the summary or tool took is not a model response time.
+			duration: null,
 			stopReason: "stop",
 			errorMessage: null,
 		});
@@ -642,7 +673,7 @@ export async function parseSessionFile(
 		}
 		if ((entry.type === "compaction" || entry.type === "branch_summary") && hasId(entry) && "usage" in entry) {
 			const iso = "timestamp" in entry ? entry.timestamp : undefined;
-			sideUsage(entry.id, entry.usage, coerceEntryTimestamp(undefined, iso), null);
+			sideUsage(entry.id, entry.usage, coerceEntryTimestamp(undefined, iso));
 			return;
 		}
 		if (!isMessageEntry(entry)) return;
@@ -654,8 +685,7 @@ export async function parseSessionFile(
 		}
 		if (role === "toolResult") {
 			const msg = entry.message as ToolResultMessage;
-			const duration = isFiniteCount(msg.durationMs) ? msg.durationMs : null;
-			sideUsage(entry.id, msg.usage, coerceEntryTimestamp(msg.timestamp, entry.timestamp), duration);
+			sideUsage(entry.id, msg.usage, coerceEntryTimestamp(msg.timestamp, entry.timestamp));
 			const link = extractToolResultLink(sessionPath, msg);
 			if (!link) return;
 			toolResults.push(link);
@@ -678,7 +708,7 @@ export async function parseSessionFile(
 			api: msg.api,
 			usage: msg.usage,
 			timestamp: coerceEntryTimestamp(msg.timestamp, entry.timestamp),
-			duration: isFiniteCount(msg.durationMs) ? msg.durationMs : null,
+			duration: requestDuration(msg, entry.timestamp),
 			// A message persisted without a terminal stop reason never completed
 			// normally: classify by whether it carried an error.
 			stopReason: msg.stopReason ?? (msg.errorMessage ? "error" : "aborted"),
@@ -715,6 +745,8 @@ export async function parseSessionFile(
 			start = reset || replay ? 0 : Math.max(0, fromOffset);
 			if (resume && state) {
 				headerFolder = state.folder;
+				sessionName = state.sessionName ?? null;
+				firstPrompt = state.firstPrompt ?? null;
 				currentModel = state.model;
 				replies = new ReplyTracker(state.pendingReplies);
 				ids = new LegacyIds(state.lastId);
@@ -751,6 +783,8 @@ export async function parseSessionFile(
 			mtimeMs: info.mtimeMs,
 			checkpoint,
 			folder: headerFolder,
+			sessionName,
+			firstPrompt,
 			model: currentModel,
 			lastId: ids.lastId,
 			pendingReplies: replies.state,

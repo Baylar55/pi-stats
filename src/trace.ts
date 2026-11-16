@@ -1,21 +1,20 @@
 /**
  * Session trace assembly for the Traces dashboard section.
  *
- * Builds a span tree (turns, model calls, tool calls, subagents, background
- * jobs) directly from raw session JSONL — the only source with tool start/end
- * times — while stats.db supplies the session-list rollups. Entry shapes are
- * mirrored structurally from the coding-agent journal (`tool_execution_start`,
- * `session_exit`, task results, async-result batches); stats never imports
- * coding-agent.
+ * Builds a span tree (turns, model calls, tool calls, child sessions) directly
+ * from raw session JSONL — the only source with tool start/end times — while
+ * stats.db supplies the session-list rollups, live request timings and the
+ * rate card. Entry shapes are pi's session format, read structurally.
  */
 
+import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { pricingPeerFor } from "@oh-my-pi/pi-catalog/compat/behavior";
-import { getBundledModel, type GeneratedProvider } from "@oh-my-pi/pi-catalog/models";
-import { getSessionsDir, isEnoent } from "@oh-my-pi/pi-utils";
-import { initDb, isScheduledCatalogModel } from "./db";
-import { extractFolderFromPath, parseAllSessionEntries, resolveUsageTotal } from "./parser";
+import { findSessionRoot, getSessionRoots } from "./config";
+import { currentDb, getFileOffsets, getSessionTimings, initDb, type RequestTiming } from "./db";
+import { extractFolderFromPath, parseAllSessionEntries, requestDuration, resolveUsageTotal } from "./parser";
+import { createRateLookup, estimateCost } from "./pricing";
+import { projectFolder } from "./projects";
 import { getSessionRollups } from "./rollup";
 import type {
 	SessionEntry,
@@ -27,30 +26,28 @@ import type {
 	TraceToolStat,
 	TraceTrack,
 } from "./types";
+import { isEnoent } from "./util";
 
-/** Client-supplied path escaped the sessions root or is not a transcript. Maps to HTTP 400. */
+/** Client-supplied path escaped the session roots or is not a transcript. Maps to HTTP 400. */
 export class TracePathError extends Error {}
 /**
  * Trace payload schema/assembly revision, folded into the HTTP ETag. Bump when
  * span assembly changes so browsers don't revalidate stale cached bodies
  * against an unchanged transcript mtime.
  */
-export const TRACE_ETAG_VERSION = 6;
+export const TRACE_ETAG_VERSION = 1;
 
 const MAX_TRACK_DEPTH = 6;
 const LABEL_MAX = 80;
 const DETAIL_MAX = 160;
-const TITLE_SCAN_BYTES = 4096;
+const HEADER_SCAN_BYTES = 4096;
 const LIST_FOLD_LIMIT = 300;
 
-/** Async job statuses after which no async-result delivery follows a `wait` or cancel handover. */
-const SETTLED_JOB_STATUSES: Record<string, true> = { completed: true, failed: true, cancelled: true };
-
 // ---------------------------------------------------------------------------
-// Structural entry views (journal shapes mirrored without importing coding-agent)
+// Structural entry views
 
 /**
- * Loose structural view of one journal entry. Session JSONL is
+ * Loose structural view of one session entry. Session JSONL is
  * outside-controlled data (old versions, crash-truncated turns), so every
  * field is optional and reads are re-checked with `typeof` before use.
  */
@@ -59,57 +56,44 @@ interface EntryView {
 	id?: string;
 	parentId?: string | null;
 	timestamp?: string;
-	customType?: string;
-	data?: Record<string, unknown>;
-	// custom_message
-	details?: Record<string, unknown>;
 	message?: MessageView;
 	// session header
 	cwd?: string;
-	title?: string;
-	// session_init
-	agent?: string;
-	resolvedModel?: string;
-	// compaction
+	// session_info
+	name?: string;
+	// compaction / branch_summary / usage
 	tokensBefore?: number;
-	tokensAfter?: number;
-	// model_change / mode_change
+	usage?: UsageView;
+	// model_change / usage
+	provider?: string;
+	modelId?: string;
 	model?: string;
-	mode?: string;
+}
+
+interface UsageView {
+	input?: unknown;
+	output?: unknown;
+	cacheRead?: unknown;
+	cacheWrite?: unknown;
+	cacheWrite1h?: unknown;
+	totalTokens?: unknown;
+	cost?: { total?: unknown };
 }
 
 /** Loose structural view of a persisted message payload. */
 interface MessageView {
 	role?: string;
-	synthetic?: boolean;
 	content?: unknown;
 	toolCallId?: string;
 	toolName?: string;
 	isError?: boolean;
-	details?: Record<string, unknown>;
 	timestamp?: number;
-	completedAt?: number;
-	duration?: number;
-	ttft?: number;
-	usage?: {
-		input?: unknown;
-		output?: unknown;
-		cacheRead?: unknown;
-		cacheWrite?: unknown;
-		totalTokens?: unknown;
-		orchestration?: { input?: unknown; output?: unknown; cacheRead?: unknown };
-		cost?: { total?: unknown };
-	};
+	durationMs?: number;
+	usage?: UsageView;
 	model?: string;
 	provider?: string;
 	stopReason?: string;
 	errorMessage?: string;
-}
-
-/** `tool_execution_start` marker facts joined to tool spans by call id. */
-interface ToolStartFact {
-	start: number;
-	detail?: string;
 }
 
 /** Pending tool call recorded from an assistant turn's `toolCall` blocks. */
@@ -121,32 +105,16 @@ interface PendingToolCall {
 	modelEnd: number;
 }
 
-/** Background job opened by an async-running tool result. */
-interface PendingBackgroundJob {
-	jobId: string;
-	start: number;
-	label: string;
-	entryId?: string;
-	end?: number;
-}
-
-/** Task tool result row, used to place subagent spans on the parent track. */
-interface TaskResultFact {
-	childId: string;
-	agent?: string;
-	task?: string;
-	durationMs?: number;
-	resultEntryId: string;
-	toolSpanEnd: number;
-}
 /** Everything one transcript contributes before cross-track assembly. */
 interface TrackScan {
 	track: TraceTrack;
-	taskResults: TaskResultFact[];
 	requests: number;
 	toolCalls: number;
-	/** Model requests whose zero cost is unknown spend (mirrors db's unpriced predicate). */
+	/** Requests whose zero cost is unknown spend (mirrors db's unpriced predicate). */
 	unpricedRequests: number;
+	/** Tokens and cost of usage that has no model span: `usage` entries, summaries, tool usage. */
+	sideTokens: number;
+	sideCost: number;
 	cwd: string | null;
 	title: string | null;
 	/** Session-header envelope timestamp (ms), for spanless traces. */
@@ -155,27 +123,26 @@ interface TrackScan {
 	lastActivity: number | undefined;
 }
 
+/** Prices one usage payload the way ingest stores it: recorded cost, else the rate-card estimate. */
+type UsagePricer = (usage: UsageView | undefined, provider: string, model: string) => { tokens: number; cost: number; unpriced: boolean };
+
 // ---------------------------------------------------------------------------
 // Path containment + transcript IO
 
-/** Resolve a client-supplied transcript path, enforcing sessions-root containment. */
+/**
+ * Resolve a client-supplied transcript path, enforcing containment in a
+ * session root. The value arrives from an HTTP query string: anything that is
+ * not a `.jsonl` file below a root is rejected before the filesystem is touched.
+ */
 function resolveSessionPath(fileParam: string): string {
 	const resolved = path.resolve(fileParam);
-	const rel = path.relative(getSessionsDir(), resolved);
-	if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) {
-		throw new TracePathError(`Path is outside the sessions directory: ${fileParam}`);
-	}
-	const base = path.basename(resolved);
-	if (!base.endsWith(".jsonl") && !base.endsWith(".jsonl.gz")) {
-		throw new TracePathError(`Not a session transcript: ${fileParam}`);
-	}
+	const inside = getSessionRoots().some(root => {
+		const rel = path.relative(root, resolved);
+		return rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
+	});
+	if (!inside) throw new TracePathError(`Path is outside the session directories: ${fileParam}`);
+	if (!resolved.endsWith(".jsonl")) throw new TracePathError(`Not a session transcript: ${fileParam}`);
 	return resolved;
-}
-
-/** Read a transcript, transparently gunzipping gc-compressed sessions. */
-async function readTranscript(resolved: string): Promise<Uint8Array> {
-	const bytes = await Bun.file(resolved).bytes();
-	return resolved.endsWith(".gz") ? Bun.gunzipSync(bytes) : bytes;
 }
 
 // ---------------------------------------------------------------------------
@@ -186,6 +153,10 @@ function toMs(iso: string | undefined): number | undefined {
 	if (typeof iso !== "string") return undefined;
 	const ms = Date.parse(iso);
 	return Number.isFinite(ms) ? ms : undefined;
+}
+
+function finite(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
 /** Whitespace-collapsed head of a string, capped at `max` chars. */
@@ -230,6 +201,33 @@ function unionLength(intervals: Array<[number, number]>): number {
 	return total + (curEnd - curStart);
 }
 
+/**
+ * Usage pricing against the open database's rate card, matching ingest
+ * (`resolveStoredCost`), so a trace's headline agrees with Costs and Requests.
+ * Without a database (offline snapshots) only recorded costs count.
+ */
+function createUsagePricer(): UsagePricer {
+	const database = currentDb();
+	const ratesOf = database ? createRateLookup(database) : undefined;
+	return (usage, provider, model) => {
+		const tokens = resolveUsageTotal(usage);
+		const recorded = finite(usage?.cost?.total);
+		if (recorded !== undefined && recorded > 0) return { tokens, cost: recorded, unpriced: false };
+		const estimate = estimateCost(
+			ratesOf?.(provider, model) ?? null,
+			{
+				input: finite(usage?.input) ?? 0,
+				output: finite(usage?.output) ?? 0,
+				cacheRead: finite(usage?.cacheRead) ?? 0,
+				cacheWrite: finite(usage?.cacheWrite) ?? 0,
+				cacheWrite1h: finite(usage?.cacheWrite1h) ?? 0,
+			},
+			tokens,
+		);
+		return { tokens, cost: estimate.cost.total, unpriced: estimate.unpriced };
+	};
+}
+
 // ---------------------------------------------------------------------------
 // Single-transcript scan
 
@@ -254,22 +252,18 @@ function activeChain(views: readonly EntryView[]): EntryView[] {
 	return views.filter(entry => typeof entry.id === "string" && keep.has(entry.id));
 }
 
-/** Argument projection for tool-span details: command/path/intent, else nothing. */
-function toolStartDetail(data: Record<string, unknown>): string | undefined {
-	let candidate: unknown;
-	const args = data.args;
-	if (args && typeof args === "object") {
-		if ("command" in args && typeof args.command === "string") candidate = args.command;
-		else if ("path" in args && typeof args.path === "string") candidate = args.path;
-	}
-	candidate ??= data.intent;
-	if (typeof candidate === "string" && candidate.trim()) return headText(candidate, DETAIL_MAX);
-	return undefined;
-}
-
-/** Serialize tool-call arguments into a bounded preview. */
+/** Tool-span detail: the command or path when the call has one, else a bounded preview of its arguments. */
 function argsPreview(args: unknown): string | undefined {
 	if (args === undefined || args === null) return undefined;
+	if (typeof args === "object") {
+		const candidate =
+			"command" in args && typeof args.command === "string"
+				? args.command
+				: "path" in args && typeof args.path === "string"
+					? args.path
+					: undefined;
+		if (candidate?.trim()) return headText(candidate, DETAIL_MAX);
+	}
 	try {
 		return headText(JSON.stringify(args), DETAIL_MAX);
 	} catch {
@@ -277,23 +271,17 @@ function argsPreview(args: unknown): string | undefined {
 	}
 }
 
-/** End the open background job with `jobId` at `at`, never before it opened; a later job may reuse the id. */
-function closeBackgroundJob(active: Map<string, PendingBackgroundJob>, jobId: string, at: number): void {
-	const job = active.get(jobId);
-	if (!job) return;
-	job.end = Math.max(job.start, at);
-	active.delete(jobId);
-}
-
 /**
- * Scan one transcript into a track: model/tool/turn/background spans plus
- * markers, and the cross-track facts (task results, request counts).
+ * Scan one transcript into a track: model/tool/turn spans plus markers, and
+ * the cross-track facts (request counts, usage without a span).
  */
 function scanTranscript(
 	entries: readonly SessionEntry[],
 	trackId: string,
 	parentTrackId: string | null,
 	file: string,
+	timings: ReadonlyMap<string, RequestTiming>,
+	price: UsagePricer,
 	header?: TraceSnapshotHeader | null,
 ): TrackScan {
 	// Boundary cast: persisted JSONL entries are re-validated field-by-field below.
@@ -302,101 +290,64 @@ function scanTranscript(
 	const spans: TraceSpan[] = [];
 	const markers: TraceMarker[] = [];
 	const pendingTools: PendingToolCall[] = [];
-	const toolStarts = new Map<string, ToolStartFact>();
-	const toolResults = new Map<string, { end: number; isError: boolean; entryId?: string; toolName: string }>();
-	const backgroundJobs: PendingBackgroundJob[] = [];
-	const activeBackgroundJobs = new Map<string, PendingBackgroundJob>();
+	const toolResults = new Map<string, { start?: number; end: number; isError: boolean; entryId?: string }>();
 	const turns: Array<{ time: number; label: string; entryId?: string }> = [];
-	const taskResults: TaskResultFact[] = [];
 
-	let sessionExit: { recordedAt: number; pendingIds: Set<string> } | undefined;
 	let cwd = typeof header?.cwd === "string" ? header.cwd : null;
-	let headerTitle = typeof header?.title === "string" ? header.title : null;
 	let headerTs = toMs(header?.timestamp);
-	let slotTitle: string | null = null;
-	let initAgent: string | null = null;
-	let initModel: string | null = null;
+	let sessionName: string | null = typeof header?.title === "string" ? header.title : null;
 	let firstAssistantModel: string | null = null;
+	let currentProvider = "unknown";
+	let currentModel = "unknown";
 	let requests = 0;
 	let unpricedRequests = 0;
+	let sideTokens = 0;
+	let sideCost = 0;
 	let lastChainTs = 0;
 
-	// Title slot and session header may sit outside the id chain — scan all entries.
+	// The session header and the name set with `/name` sit outside the id chain — scan all entries.
 	for (const raw of views) {
-		if (raw.type === "title" && typeof raw.title === "string") slotTitle = raw.title;
-		else if (raw.type === "session") {
+		if (raw.type === "session") {
 			if (typeof raw.cwd === "string") cwd = raw.cwd;
-			if (typeof raw.title === "string") headerTitle = raw.title;
 			headerTs = toMs(raw.timestamp);
-		} else if (raw.type === "session_init") {
-			if (typeof raw.agent === "string") initAgent = raw.agent;
-			if (typeof raw.resolvedModel === "string") initModel = raw.resolvedModel;
+		} else if (raw.type === "session_info") {
+			sessionName = typeof raw.name === "string" && raw.name.trim() ? raw.name.trim() : null;
 		}
 	}
+
+	/** Usage that produced no model span still counts as a request, as it does at ingest. */
+	const countSideUsage = (usage: UsageView | undefined, provider: string, model: string): void => {
+		if (!usage || typeof usage !== "object") return;
+		const priced = price(usage, provider, model);
+		requests++;
+		sideTokens += priced.tokens;
+		sideCost += priced.cost;
+		if (priced.unpriced) unpricedRequests++;
+	};
 
 	for (const entry of chain) {
 		const envelopeTs = toMs(entry.timestamp);
 		if (envelopeTs !== undefined && envelopeTs > lastChainTs) lastChainTs = envelopeTs;
 
-		if (entry.type === "custom") {
-			const data = entry.data ?? {};
-			if (entry.customType === "tool_execution_start") {
-				const callId = data.toolCallId;
-				if (typeof callId === "string") {
-					const start = (typeof data.startedAt === "string" ? toMs(data.startedAt) : undefined) ?? envelopeTs;
-					if (start !== undefined) toolStarts.set(callId, { start, detail: toolStartDetail(data) });
-				}
-			} else if (entry.customType === "session_exit") {
-				const recordedAt = (typeof data.recordedAt === "string" ? toMs(data.recordedAt) : undefined) ?? envelopeTs;
-				const pendingIds = new Set<string>();
-				if (Array.isArray(data.pendingToolCalls)) {
-					for (const pending of data.pendingToolCalls) {
-						if (!pending || typeof pending !== "object" || !("toolCallId" in pending)) continue;
-						if (typeof pending.toolCallId === "string") pendingIds.add(pending.toolCallId);
-					}
-				}
-				if (recordedAt !== undefined) {
-					sessionExit = { recordedAt, pendingIds };
-					markers.push({
-						time: recordedAt,
-						kind: "session_exit",
-						label: typeof data.kind === "string" ? data.kind : "exit",
-					});
-				}
+		if (entry.type === "usage") {
+			countSideUsage(entry.usage, entry.provider ?? "unknown", entry.model ?? "unknown");
+			continue;
+		}
+		if (entry.type === "compaction" || entry.type === "branch_summary") {
+			countSideUsage(entry.usage, currentProvider, currentModel);
+			if (entry.type === "compaction" && envelopeTs !== undefined) {
+				markers.push({ time: envelopeTs, kind: "compaction", label: `compaction ${compactTokens(entry.tokensBefore)}` });
 			}
 			continue;
 		}
-
-		if (entry.type === "custom_message") {
-			// Async-result deliveries persist as `custom_message` entries carrying `details.jobs[].jobId`.
-			if (entry.customType === "async-result" && envelopeTs !== undefined && Array.isArray(entry.details?.jobs)) {
-				for (const job of entry.details.jobs) {
-					if (job && typeof job === "object" && "jobId" in job && typeof job.jobId === "string") {
-						closeBackgroundJob(activeBackgroundJobs, job.jobId, envelopeTs);
-					}
-				}
+		if (entry.type === "model_change") {
+			if (typeof entry.provider === "string" && typeof entry.modelId === "string") {
+				currentProvider = entry.provider;
+				currentModel = entry.modelId;
 			}
-			continue;
-		}
-
-		if (entry.type === "compaction" && envelopeTs !== undefined) {
-			markers.push({
-				time: envelopeTs,
-				kind: "compaction",
-				label: `compaction ${compactTokens(entry.tokensBefore)}→${compactTokens(entry.tokensAfter)}`,
-			});
-			continue;
-		}
-		if (entry.type === "model_change" && envelopeTs !== undefined) {
-			markers.push({ time: envelopeTs, kind: "model_change", label: String(entry.model ?? "model change") });
-			continue;
-		}
-		if (entry.type === "mode_change" && envelopeTs !== undefined) {
-			markers.push({ time: envelopeTs, kind: "mode_change", label: String(entry.mode ?? "mode change") });
-			continue;
-		}
-		if (entry.type === "reset_boundary" && envelopeTs !== undefined) {
-			markers.push({ time: envelopeTs, kind: "reset", label: "reset" });
+			if (envelopeTs !== undefined) {
+				markers.push({ time: envelopeTs, kind: "model_change", label: String(entry.modelId ?? "model change") });
+			}
 			continue;
 		}
 
@@ -405,46 +356,28 @@ function scanTranscript(
 
 		if (msg.role === "assistant") {
 			requests++;
-			// Mirror the db's unpriced predicate so the trace headline agrees
-			// with Costs/Recent Requests: a zero that is unknown spend, not free.
+			if (typeof msg.provider === "string") currentProvider = msg.provider;
+			if (typeof msg.model === "string") currentModel = msg.model;
 			// Counted before the span-timing `continue` below so a fully
-			// dateless entry still surfaces as N/A rather than vanishing.
-			// Derive a missing total from the buckets via the shared ingest
-			// helper, so a legacy entry with tokens but no total still
-			// classifies as unpriced.
-			const totalTokens = resolveUsageTotal(msg.usage);
-			const costObj = msg.usage?.cost;
-			const costTotal =
-				typeof costObj?.total === "number" && Number.isFinite(costObj.total) ? costObj.total : undefined;
-			if (totalTokens > 0 && (costTotal === undefined || costTotal === 0)) {
-				const provider = typeof msg.provider === "string" ? msg.provider : "";
-				const model = typeof msg.model === "string" ? msg.model : "";
-				const peer = provider && model ? pricingPeerFor(provider, model) : undefined;
-				if (peer) {
-					const priced = peer.peers.some(peerProvider => {
-						const ref = getBundledModel(peerProvider as GeneratedProvider, peer.peerId)?.cost;
-						return ref && (ref.input !== 0 || ref.output !== 0 || ref.cacheRead !== 0 || ref.cacheWrite !== 0);
-					});
-					if (!priced) unpricedRequests++;
-				} else if (costObj == null && provider && model) {
-					const hasTimestamp =
-						(typeof msg.timestamp === "number" && Number.isFinite(msg.timestamp) && msg.timestamp > 0) ||
-						envelopeTs !== undefined;
-					if (!hasTimestamp && isScheduledCatalogModel(provider, model)) unpricedRequests++;
-				}
-			}
-			let start = typeof msg.timestamp === "number" && Number.isFinite(msg.timestamp) ? msg.timestamp : undefined;
-			let end =
-				typeof msg.completedAt === "number" && Number.isFinite(msg.completedAt)
-					? msg.completedAt
-					: start !== undefined && typeof msg.duration === "number"
-						? start + msg.duration
-						: undefined;
+			// dateless entry still surfaces rather than vanishing.
+			const priced = price(msg.usage, currentProvider, currentModel);
+			if (priced.unpriced) unpricedRequests++;
+
+			const timing = typeof entry.id === "string" ? timings.get(entry.id) : undefined;
+			// The response's duration: recorded, derived from its two timestamps, else the live timing.
+			const duration = requestDuration(msg, entry.timestamp) ?? (timing ? timing.endAt - timing.requestStart : undefined);
+			let start = finite(msg.timestamp);
+			if (start !== undefined && start <= 0) start = undefined;
+			let end = start !== undefined && duration !== undefined ? start + duration : undefined;
 			if (start === undefined) {
-				const fallbackEnd = end ?? envelopeTs;
-				if (fallbackEnd === undefined) continue;
+				const fallbackEnd = envelopeTs;
+				if (fallbackEnd === undefined) {
+					sideTokens += priced.tokens;
+					sideCost += priced.cost;
+					continue;
+				}
 				end = fallbackEnd;
-				start = end - (typeof msg.duration === "number" ? msg.duration : 0);
+				start = end - (duration ?? 0);
 			}
 			if (end === undefined) end = envelopeTs ?? start;
 			end = Math.max(start, end);
@@ -461,10 +394,11 @@ function scanTranscript(
 			if (detail) span.detail = detail;
 			if (entry.id) span.entryId = entry.id;
 			if (typeof msg.model === "string") span.model = msg.model;
-			if (totalTokens > 0) span.tokens = totalTokens;
-
-			if (costTotal !== undefined) span.cost = costTotal;
-			if (typeof msg.ttft === "number") span.ttft = msg.ttft;
+			if (priced.tokens > 0) span.tokens = priced.tokens;
+			// An unpriced request has no cost to show; the summary counts it instead.
+			if (!priced.unpriced) span.cost = priced.cost;
+			// pi records no time to first token: only a live timing knows it.
+			if (timing && timing.firstTokenAt !== null) span.ttft = Math.max(0, timing.firstTokenAt - timing.requestStart);
 			if (msg.stopReason === "error" || msg.errorMessage) span.isError = true;
 			spans.push(span);
 			if (Array.isArray(msg.content)) {
@@ -485,108 +419,34 @@ function scanTranscript(
 		}
 
 		if (msg.role === "toolResult") {
+			countSideUsage(msg.usage, currentProvider, currentModel);
 			if (typeof msg.toolCallId !== "string") continue;
-			const end = typeof msg.timestamp === "number" && Number.isFinite(msg.timestamp) ? msg.timestamp : envelopeTs;
+			const end = finite(msg.timestamp) ?? envelopeTs;
 			if (end === undefined) continue;
+			// Newer pi versions record how long the tool ran; older results only know when it ended.
+			const ran = finite(msg.durationMs);
 			toolResults.set(msg.toolCallId, {
+				start: ran !== undefined && ran >= 0 ? end - ran : undefined,
 				end,
 				isError: msg.isError === true,
 				entryId: entry.id,
-				toolName: msg.toolName ?? "tool",
 			});
-
-			const details = msg.details;
-			const asyncInfo = details?.async;
-			if (
-				asyncInfo &&
-				typeof asyncInfo === "object" &&
-				"state" in asyncInfo &&
-				asyncInfo.state === "running" &&
-				"jobId" in asyncInfo &&
-				typeof asyncInfo.jobId === "string"
-			) {
-				const job: PendingBackgroundJob = {
-					jobId: asyncInfo.jobId,
-					start: end,
-					label: headText(`${msg.toolName ?? "tool"} job`, LABEL_MAX),
-					entryId: entry.id,
-				};
-				backgroundJobs.push(job);
-				activeBackgroundJobs.set(job.jobId, job);
-			}
-			// A `wait` (`details.jobs`) or proc:// cancel (`details.proc.jobs`) that reports a settled
-			// job replaces its async-result delivery, so the job closes when it settled, or at this result.
-			const proc = details?.proc;
-			const reportedJobs =
-				details?.op === "wait"
-					? details.jobs
-					: proc && typeof proc === "object" && "op" in proc && proc.op === "cancel" && "jobs" in proc
-						? proc.jobs
-						: undefined;
-			if (Array.isArray(reportedJobs)) {
-				for (const job of reportedJobs) {
-					if (
-						job &&
-						typeof job === "object" &&
-						"id" in job &&
-						typeof job.id === "string" &&
-						"status" in job &&
-						typeof job.status === "string" &&
-						SETTLED_JOB_STATUSES[job.status] === true
-					) {
-						const settledAt =
-							"settledAtMs" in job && typeof job.settledAtMs === "number" && Number.isFinite(job.settledAtMs)
-								? Math.min(job.settledAtMs, end)
-								: end;
-						closeBackgroundJob(activeBackgroundJobs, job.id, settledAt);
-					}
-				}
-			}
-			if (msg.toolName === "task" && Array.isArray(details?.results)) {
-				for (const result of details.results) {
-					if (!result || typeof result !== "object" || !("id" in result) || typeof result.id !== "string")
-						continue;
-					taskResults.push({
-						childId: result.id,
-						agent: "agent" in result && typeof result.agent === "string" ? result.agent : undefined,
-						task: "task" in result && typeof result.task === "string" ? result.task : undefined,
-						durationMs:
-							"durationMs" in result && typeof result.durationMs === "number" ? result.durationMs : undefined,
-						resultEntryId: entry.id ?? "",
-						toolSpanEnd: end,
-					});
-				}
-			}
 			continue;
 		}
 
-		if (msg.role === "user" && msg.synthetic !== true) {
-			const time = typeof msg.timestamp === "number" && Number.isFinite(msg.timestamp) ? msg.timestamp : envelopeTs;
+		if (msg.role === "user") {
+			const time = finite(msg.timestamp) ?? envelopeTs;
 			if (time === undefined) continue;
-			turns.push({
-				time,
-				label: contentHead(msg.content, LABEL_MAX) ?? "user",
-				entryId: entry.id,
-			});
+			turns.push({ time, label: contentHead(msg.content, LABEL_MAX) ?? "user", entryId: entry.id });
 		}
 	}
 
-	// Tool spans: join call blocks with start markers and results.
+	// Tool spans: join call blocks with their results.
 	for (const pending of pendingTools) {
-		const marker = toolStarts.get(pending.callId);
 		const result = toolResults.get(pending.callId);
-		const start = marker?.start ?? pending.modelEnd;
-		let end: number;
-		let unterminated = false;
-		if (result) {
-			end = result.end;
-		} else if (sessionExit?.pendingIds.has(pending.callId)) {
-			end = sessionExit.recordedAt;
-			unterminated = true;
-		} else {
-			end = lastChainTs || start;
-			unterminated = true;
-		}
+		const start = result?.start ?? pending.modelEnd;
+		// A call with no result was still running when the transcript ends.
+		const end = result ? result.end : lastChainTs || start;
 		const span: TraceSpan = {
 			id: `${trackId}:${pending.assistantEntryId}:${pending.callId}`,
 			kind: "tool",
@@ -595,27 +455,11 @@ function scanTranscript(
 			label: headText(pending.name, LABEL_MAX),
 			toolCallId: pending.callId,
 		};
-		const detail = marker?.detail ?? pending.argsPreview;
-		if (detail) span.detail = detail;
+		if (pending.argsPreview) span.detail = pending.argsPreview;
 		const entryId = result?.entryId ?? pending.assistantEntryId;
 		if (entryId) span.entryId = entryId;
 		if (result?.isError) span.isError = true;
-		if (unterminated) span.unterminated = true;
-		spans.push(span);
-	}
-
-	// Background spans: opened by an async-running tool result, closed by the async-result delivery.
-	for (const [backgroundIndex, job] of backgroundJobs.entries()) {
-		const end = job.end ?? (lastChainTs || job.start);
-		const span: TraceSpan = {
-			id: `${trackId}:bg:${backgroundIndex}:${job.jobId}`,
-			kind: "background",
-			start: job.start,
-			end: Math.max(job.start, end),
-			label: job.label,
-		};
-		if (job.entryId) span.entryId = job.entryId;
-		if (job.end === undefined) span.unterminated = true;
+		if (!result) span.unterminated = true;
 		spans.push(span);
 	}
 
@@ -654,18 +498,20 @@ function scanTranscript(
 			id: trackId,
 			parentId: parentTrackId,
 			label: "",
-			agent: initAgent,
-			model: initModel ?? firstAssistantModel,
+			agent: null,
+			model: firstAssistantModel,
 			file,
 			spans,
 			markers,
 		},
-		taskResults,
 		requests,
 		toolCalls: pendingTools.length,
 		unpricedRequests,
+		sideTokens,
+		sideCost,
 		cwd,
-		title: slotTitle ?? headerTitle,
+		// An unnamed session is titled by its first prompt, as in pi's `/resume`.
+		title: sessionName ?? (turns.length > 0 ? turns[0].label : null),
 		headerTs,
 		firstActivity,
 		lastActivity,
@@ -675,14 +521,16 @@ function scanTranscript(
 // ---------------------------------------------------------------------------
 // Recursive track tree
 
-/** Strip the transcript extension (`.jsonl` / `.jsonl.gz`). */
+/** Strip the transcript extension. */
 function transcriptStem(file: string): string {
-	return file.endsWith(".jsonl.gz") ? file.slice(0, -".jsonl.gz".length) : file.slice(0, -".jsonl".length);
+	return file.slice(0, -".jsonl".length);
 }
 
 /**
- * Build the track for one transcript and recurse into its artifacts directory.
- * Appends tracks to `out` in DFS order and places subagent spans on parents.
+ * Build the track for one transcript and recurse into the directory named
+ * after it, where an extension that persists child sessions keeps them (pi
+ * core writes none). Appends tracks to `out` in DFS order and places child
+ * spans on parents.
  */
 async function buildTrackTree(
 	file: string,
@@ -692,98 +540,61 @@ async function buildTrackTree(
 	visited: Set<string>,
 	out: TraceTrack[],
 	scans: TrackScan[],
+	price: UsagePricer,
 ): Promise<TrackScan | null> {
 	if (visited.has(file)) return null;
 	visited.add(file);
 
 	let bytes: Uint8Array;
 	try {
-		bytes = await readTranscript(file);
+		bytes = await fs.readFile(file);
 	} catch (err) {
 		if (isEnoent(err)) return null;
 		throw err;
 	}
 
-	const scan = scanTranscript(parseAllSessionEntries(bytes), trackId, parentTrackId, file);
+	const scan = scanTranscript(parseAllSessionEntries(bytes), trackId, parentTrackId, file, getSessionTimings(file), price);
 	out.push(scan.track);
 	scans.push(scan);
 
-	const childrenById = new Map<string, TrackScan>();
+	const children = new Map<string, TrackScan>();
 	if (depth < MAX_TRACK_DEPTH) {
-		const artifactsDir = transcriptStem(file);
+		const childDir = transcriptStem(file);
 		let names: string[] = [];
 		try {
-			names = await fs.readdir(artifactsDir);
+			names = await fs.readdir(childDir);
 		} catch (err) {
-			if (!isEnoent(err)) throw err;
+			// Almost always ENOENT; a plain file of that name is no directory either.
+			if (!isEnoent(err) && !(err instanceof Error && "code" in err && err.code === "ENOTDIR")) throw err;
 		}
 		names.sort();
 		for (const name of names) {
-			// `.jsonl.*.bak` backups fail both suffix checks and are skipped.
-			if (!name.endsWith(".jsonl") && !name.endsWith(".jsonl.gz")) continue;
-			const childFile = path.join(artifactsDir, name);
+			if (!name.endsWith(".jsonl")) continue;
+			const childFile = path.join(childDir, name);
 			const stem = path.basename(transcriptStem(childFile));
 			const childTrackId = trackId === "main" ? stem : `${trackId}/${stem}`;
-			const childScan = await buildTrackTree(childFile, childTrackId, trackId, depth + 1, visited, out, scans);
+			const childScan = await buildTrackTree(childFile, childTrackId, trackId, depth + 1, visited, out, scans, price);
 			if (!childScan) continue;
-			const isAdvisor = stem === "__advisor" || stem.startsWith("__advisor.");
-			childScan.track.label = isAdvisor
-				? "Advisor"
-				: headText(`${childScan.track.agent ?? "agent"} ${stem}`, LABEL_MAX);
-			childrenById.set(stem, childScan);
+			childScan.track.label = headText(`agent ${stem}`, LABEL_MAX);
+			children.set(stem, childScan);
 		}
 	}
 
-	linkChildTracks(scan, childrenById);
+	linkChildTracks(scan, children);
 	return scan;
 }
 
-/** Place child activity and structured task-result spans on their parent track. */
-function linkChildTracks(scan: TrackScan, childrenById: ReadonlyMap<string, TrackScan>): void {
-	const trackId = scan.track.id;
-	// Subagent spans on this track, one per task SingleResult.
-	const linkedChildren = new Set<string>();
-	for (const result of scan.taskResults) {
-		const child = childrenById.get(result.childId);
-		if (child) linkedChildren.add(result.childId);
-		let start: number;
-		let end: number;
-		if (child && child.firstActivity !== undefined && child.lastActivity !== undefined) {
-			start = child.firstActivity;
-			end = child.lastActivity;
-		} else if (result.durationMs !== undefined) {
-			start = result.toolSpanEnd - result.durationMs;
-			end = result.toolSpanEnd;
-		} else {
-			continue;
-		}
-		const span: TraceSpan = {
-			id: `${trackId}:${result.resultEntryId}:${result.childId}`,
-			kind: "subagent",
-			start,
-			end: Math.max(start, end),
-			label: headText(result.agent ?? result.childId, LABEL_MAX),
-		};
-		if (result.task) span.detail = headText(result.task, DETAIL_MAX);
-		if (result.resultEntryId) span.entryId = result.resultEntryId;
-		if (child) {
-			span.childTrackId = child.track.id;
-			if (child.track.model) span.model = child.track.model;
-		}
-		scan.track.spans.push(span);
-	}
-	// Children with no structured task result — async task jobs (results are
-	// delivered as formatted text), crashed parents, advisors — still get a
-	// parent span from their own activity bounds so the Agents lane shows them.
-	for (const [stem, child] of childrenById) {
-		if (linkedChildren.has(stem)) continue;
+/** Give each child session a span on its parent track from its own activity bounds. */
+function linkChildTracks(scan: TrackScan, children: ReadonlyMap<string, TrackScan>): void {
+	if (children.size === 0) return;
+	for (const [stem, child] of children) {
 		if (child.firstActivity === undefined || child.lastActivity === undefined) continue;
 		const span: TraceSpan = {
-			id: `${trackId}:sub:${stem}`,
+			id: `${scan.track.id}:sub:${stem}`,
 			kind: "subagent",
 			start: child.firstActivity,
 			end: Math.max(child.firstActivity, child.lastActivity),
-			label: headText(child.track.agent ?? child.track.label, LABEL_MAX),
+			label: headText(child.track.label, LABEL_MAX),
 			childTrackId: child.track.id,
 		};
 		if (child.track.model) span.model = child.track.model;
@@ -797,12 +608,12 @@ function linkChildTracks(scan: TrackScan, childrenById: ReadonlyMap<string, Trac
 
 // Single-entry memo: the dashboard polls one open trace every 15s. Keyed on
 // the root file's mtime PLUS a fingerprint of the child-transcript SET under
-// the root's artifacts tree (one cheap readdir+stat walk, no parse). A
+// the root's child directory (one cheap readdir+stat walk, no parse). A
 // high-water mark alone is blind to deletions and to older-mtime
 // replacements, so the fingerprint encodes every child's (name, mtimeMs)
 // pair: any append, delete, rename, or content swap changes the key and the
 // memo misses. Membership diffs are bounded (depth + file count caps) so a
-// pathological artifacts tree cannot blow the key.
+// pathological tree cannot blow the key.
 interface TraceMemoEntry {
 	mtimeMs: number;
 	childFingerprint: string;
@@ -817,27 +628,27 @@ let traceMemo: { file: string; entry: TraceMemoEntry } | undefined;
  * only, no parse). The count makes an empty directory distinguishable from a
  * missing one and keeps renames visible. The walk is depth-capped; the raw
  * string still grows with child count, but the wire ETag hashes it, so a large
- * tree cannot inflate the request header. Best-effort: a raced gc deletion is
+ * tree cannot inflate the request header. Best-effort: a raced deletion is
  * recorded as `name@gone` (which itself changes the fingerprint and misses the
  * memo — the safe direction).
  */
 async function childTranscriptsFingerprint(rootFile: string, depth = 0): Promise<string> {
 	if (depth > MAX_TRACK_DEPTH) return "";
+	const dir = transcriptStem(rootFile);
 	let names: string[] = [];
 	try {
-		names = await fs.readdir(transcriptStem(rootFile));
+		names = await fs.readdir(dir);
 	} catch {
 		return "";
 	}
 	names.sort();
-	const dir = transcriptStem(rootFile);
-	const transcriptNames = names.filter(name => name.endsWith(".jsonl") || name.endsWith(".jsonl.gz"));
+	const transcriptNames = names.filter(name => name.endsWith(".jsonl"));
 	const childParts = await Promise.all(
 		transcriptNames.map(async name => {
 			const childFile = path.join(dir, name);
 			try {
 				const stat = await fs.stat(childFile);
-				// Recurse like the builder (nested subagents), without parsing.
+				// Recurse like the builder (nested children), without parsing.
 				const nested = await childTranscriptsFingerprint(childFile, depth + 1);
 				return nested ? `${name}@${stat.mtimeMs},${name}/{${nested}}` : `${name}@${stat.mtimeMs}`;
 			} catch {
@@ -857,13 +668,13 @@ export interface TraceFingerprint {
 
 /**
  * Compact wire ETag key. The raw child fingerprint is unbounded — a
- * subagent-heavy session can produce tens of kilobytes of `name@mtime` pairs.
- * Sending that string back in `If-None-Match` exceeds Bun's 16 KiB request
- * header limit (HTTP 431), so hash it to a fixed-size key first. Root size is
- * part of the key because a coarse mtime can miss an append.
+ * child-heavy session can produce tens of kilobytes of `name@mtime` pairs,
+ * more than a request header may carry back in `If-None-Match`, so hash it to
+ * a fixed-size key first. Root size is part of the key because a coarse mtime
+ * can miss an append.
  */
 function traceEtagKey(rootMtimeMs: number, rootSize: number, childFingerprint: string): string {
-	const digest = new Bun.CryptoHasher("sha256").update(childFingerprint).digest("hex");
+	const digest = createHash("sha256").update(childFingerprint).digest("hex");
 	return `${rootMtimeMs}:${rootSize}:${digest}`;
 }
 
@@ -872,11 +683,20 @@ export function traceEtagForFingerprint(fingerprint: TraceFingerprint): string {
 	return traceEtagKey(fingerprint.rootMtimeMs, fingerprint.rootSize, fingerprint.childFingerprint);
 }
 
-/** Stat the root and walk its child transcripts (readdir+stat, no parse). */
+/**
+ * Stat the root and walk its child transcripts (readdir+stat, no parse). The
+ * count of live timings recorded for the root joins the child fingerprint: a
+ * timing lands in the database after the transcript was written, and changes
+ * what the trace shows without touching the file.
+ */
 async function readTraceFingerprint(resolved: string): Promise<TraceFingerprint> {
 	const stat = await fs.stat(resolved);
 	const childFingerprint = await childTranscriptsFingerprint(resolved);
-	return { rootMtimeMs: stat.mtimeMs, rootSize: stat.size, childFingerprint };
+	return {
+		rootMtimeMs: stat.mtimeMs,
+		rootSize: stat.size,
+		childFingerprint: `t=${getSessionTimings(resolved).size},${childFingerprint}`,
+	};
 }
 
 /**
@@ -900,13 +720,15 @@ export function traceMemoForTests(): { file: string; mtimeMs: number } | undefin
 
 /**
  * Assemble the full span tree for one root session transcript.
- * Throws {@link TracePathError} for paths outside the sessions root; ENOENT
+ * Throws {@link TracePathError} for paths outside the session roots; ENOENT
  * passes through for the caller's 404 mapping. `fingerprint` may carry the
  * {@link traceFingerprintForEtag} value the caller just computed for the same
  * file (its ETag pre-check), sparing a second walk.
  */
 export async function buildSessionTrace(fileParam: string, fingerprint?: TraceFingerprint): Promise<SessionTrace> {
 	const resolved = resolveSessionPath(fileParam);
+	// Live timings and the rate card come from the database.
+	await initDb();
 	const memo = traceMemo?.file === resolved ? traceMemo.entry : undefined;
 	// Pre-build child fingerprint on EVERY path (hit check and rebuild
 	// alike): the post-build race guard compares against this, so a child
@@ -925,17 +747,17 @@ export async function buildSessionTrace(fileParam: string, fingerprint?: TraceFi
 
 	const tracks: TraceTrack[] = [];
 	const scans: TrackScan[] = [];
-	const rootScan = await buildTrackTree(resolved, "main", null, 0, new Set(), tracks, scans);
+	const rootScan = await buildTrackTree(resolved, "main", null, 0, new Set(), tracks, scans, createUsagePricer());
 	if (!rootScan) {
 		throw Object.assign(new Error(`ENOENT: session not found: ${resolved}`), { code: "ENOENT" });
 	}
 	// Re-collect the fingerprint AFTER the parse: a child append landing
 	// between the pre-build check and now would otherwise be baked into
 	// neither the trace nor the key.
-	const childFingerprint = await childTranscriptsFingerprint(resolved);
+	const post = await readTraceFingerprint(resolved).catch(() => null);
 	// Root rewritten mid-build: same no-cache rule as the child race below.
-	const rootChanged = (await fs.stat(resolved).catch(() => null))?.mtimeMs !== rootMtimeMs;
-	const raced = childFingerprint !== preChildFingerprint;
+	const rootChanged = post?.rootMtimeMs !== rootMtimeMs;
+	const raced = post?.childFingerprint !== preChildFingerprint;
 	// Raced builds keep the PRE-build fingerprint as their ETag: the parsed
 	// bytes predate the racy write, so claiming the post-write state would
 	// 304 stale forever when that write was the child's last. The pre-build
@@ -943,34 +765,35 @@ export async function buildSessionTrace(fileParam: string, fingerprint?: TraceFi
 	// and rebuilds — at most one stale response per race, never an
 	// indefinitely cached one. Unraced builds use the post-build key, which
 	// equals the pre-build key by construction.
-	const etagFingerprint = raced || rootChanged ? preChildFingerprint : childFingerprint;
 	const trace = assembleSessionTrace(
 		rootScan,
 		tracks,
 		scans,
 		rootMtimeMs,
-		traceEtagKey(rootMtimeMs, rootSize, etagFingerprint),
+		traceEtagKey(rootMtimeMs, rootSize, preChildFingerprint),
 	);
 	if (!raced && !rootChanged) {
 		traceMemo = {
 			file: resolved,
-			entry: { mtimeMs: rootMtimeMs, childFingerprint, trace },
+			entry: { mtimeMs: rootMtimeMs, childFingerprint: preChildFingerprint, trace },
 		};
 	}
 	return trace;
 }
 
-/** Header metadata used by snapshot traces, including journals without a schema version. */
+/** Header metadata used by snapshot traces. */
 export interface TraceSnapshotHeader {
 	timestamp?: string;
 	cwd?: string;
 	title?: string;
 }
 
-/** The journal data for one embedded transcript; its header may be stored separately. */
+/** The entries of one embedded transcript; its header may be stored separately. */
 export interface SessionTraceSnapshot {
 	header?: TraceSnapshotHeader | null;
 	entries: readonly SessionEntry[];
+	/** Live timings by entry id, when the caller has them. */
+	timings?: ReadonlyMap<string, RequestTiming>;
 }
 
 /** A collected child transcript, keyed by its slash-joined path from the root. */
@@ -978,10 +801,13 @@ export interface SubSessionTraceSnapshot extends SessionTraceSnapshot {
 	parent: string | null;
 }
 
+const NO_TIMINGS: ReadonlyMap<string, RequestTiming> = new Map();
+
 /**
  * Assemble an offline trace using the same timing joins and rollups as the live
- * filesystem builder. Only supplied snapshots participate: no filesystem, DB,
- * network, or wall-clock reads. Track files are snapshot keys, never disk paths.
+ * filesystem builder. Only supplied snapshots participate: no filesystem,
+ * network, or wall-clock reads; the rate card is consulted only when a
+ * database is already open. Track files are snapshot keys, never disk paths.
  *
  * Missing parent transcripts attach their readable descendants to main. Unlike
  * filesystem discovery, already-collected snapshots need no depth limit.
@@ -1004,23 +830,21 @@ export function buildSessionTraceFromSnapshots(
 		}
 	}
 
+	const price = createUsagePricer();
 	const tracks: TraceTrack[] = [];
 	const scans: TrackScan[] = [];
 	const visit = (snapshot: SessionTraceSnapshot, key: string, parentId: string | null): TrackScan => {
-		const scan = scanTranscript(snapshot.entries, key, parentId, key, snapshot.header);
+		const scan = scanTranscript(snapshot.entries, key, parentId, key, snapshot.timings ?? NO_TIMINGS, price, snapshot.header);
 		tracks.push(scan.track);
 		scans.push(scan);
-		const childrenById = new Map<string, TrackScan>();
+		const linked = new Map<string, TrackScan>();
 		for (const [childKey, childSnapshot] of children.get(parentId === null ? null : key) ?? []) {
 			const child = visit(childSnapshot, childKey, key);
 			const stem = childKey.slice(childKey.lastIndexOf("/") + 1);
-			child.track.label =
-				stem === "__advisor" || stem.startsWith("__advisor.")
-					? "Advisor"
-					: headText(`${child.track.agent ?? "agent"} ${stem}`, LABEL_MAX);
-			childrenById.set(stem, child);
+			child.track.label = headText(`agent ${stem}`, LABEL_MAX);
+			linked.set(stem, child);
 		}
-		linkChildTracks(scan, childrenById);
+		linkChildTracks(scan, linked);
 		return scan;
 	};
 	const rootScan = visit(root, "main", null);
@@ -1051,6 +875,8 @@ function assembleSessionTrace(
 		requests += scan.requests;
 		toolCalls += scan.toolCalls;
 		unpricedRequests += scan.unpricedRequests;
+		totalTokens += scan.sideTokens;
+		costTotal += scan.sideCost;
 		for (const span of scan.track.spans) {
 			intervals.push([span.start, span.end]);
 			if (startedAt === undefined || span.start < startedAt) startedAt = span.start;
@@ -1120,12 +946,12 @@ function assembleSessionTrace(
 	};
 }
 
-/** Fetch one full journal entry by id from a transcript, for the span drawer. */
+/** Fetch one full session entry by id from a transcript, for the span drawer. */
 export async function getTraceEntry(fileParam: string, entryId: string): Promise<SessionEntry | null> {
 	const resolved = resolveSessionPath(fileParam);
 	let bytes: Uint8Array;
 	try {
-		bytes = await readTranscript(resolved);
+		bytes = await fs.readFile(resolved);
 	} catch (err) {
 		if (isEnoent(err)) return null;
 		throw err;
@@ -1139,90 +965,59 @@ export async function getTraceEntry(fileParam: string, entryId: string): Promise
 // ---------------------------------------------------------------------------
 // Session list
 
-interface SessionMetadata {
-	title: string | null;
-	cwd: string | null;
-}
+const headerCwdCache = new Map<string, { mtimeMs: number; cwd: string | null }>();
 
-const metadataCache = new Map<string, SessionMetadata & { mtimeMs: number }>();
-
-/** Read enough decompressed transcript bytes to cover the title slot and session header. */
-async function readSessionMetadataHead(file: string): Promise<string> {
-	if (!file.endsWith(".gz")) return Bun.file(file).slice(0, TITLE_SCAN_BYTES).text();
-
-	const reader = Bun.file(file).stream().pipeThrough(new DecompressionStream("gzip")).getReader();
-	const decoder = new TextDecoder();
-	let remaining = TITLE_SCAN_BYTES;
-	let head = "";
+/** The `cwd` of a transcript the sync has not indexed yet, from its header line. */
+async function readHeaderCwd(file: string): Promise<string | null> {
+	let handle: fs.FileHandle | undefined;
 	try {
-		while (remaining > 0) {
-			const { done, value } = await reader.read();
-			if (done) {
-				head += decoder.decode();
-				break;
-			}
-			const chunk = value.subarray(0, remaining);
-			remaining -= chunk.byteLength;
-			head += decoder.decode(chunk, { stream: remaining > 0 && chunk.byteLength === value.byteLength });
-			if (chunk.byteLength < value.byteLength) break;
+		handle = await fs.open(file, "r");
+		const { mtimeMs } = await handle.stat();
+		const cached = headerCwdCache.get(file);
+		if (cached && cached.mtimeMs === mtimeMs) return cached.cwd;
+		const buffer = Buffer.allocUnsafe(HEADER_SCAN_BYTES);
+		const { bytesRead } = await handle.read(buffer, 0, HEADER_SCAN_BYTES, 0);
+		const firstLine = buffer.subarray(0, bytesRead).toString("utf8").split("\n", 1)[0];
+		let cwd: string | null = null;
+		try {
+			const parsed: unknown = JSON.parse(firstLine);
+			if (parsed && typeof parsed === "object" && "cwd" in parsed && typeof parsed.cwd === "string") cwd = parsed.cwd;
+		} catch {
+			// A header longer than the scan window, or no header: fall back to the directory name.
 		}
+		headerCwdCache.set(file, { mtimeMs, cwd });
+		return cwd;
+	} catch {
+		return null;
 	} finally {
-		await reader.cancel();
+		await handle?.close();
 	}
-	return head;
-}
-
-/** Read list metadata from the fixed title slot and session header. */
-async function readSessionMetadata(file: string): Promise<SessionMetadata> {
-	let mtimeMs: number;
-	try {
-		mtimeMs = (await fs.stat(file)).mtimeMs;
-	} catch {
-		return { title: null, cwd: null };
-	}
-	const cached = metadataCache.get(file);
-	if (cached && cached.mtimeMs === mtimeMs) return cached;
-
-	let title: string | null = null;
-	let cwd: string | null = null;
-	try {
-		const head = await readSessionMetadataHead(file);
-		for (const line of head.split("\n")) {
-			if (!line.trim()) continue;
-			let parsed: EntryView;
-			try {
-				// Boundary cast: fields re-checked with typeof below.
-				parsed = JSON.parse(line) as EntryView;
-			} catch {
-				continue;
-			}
-			if (parsed.type === "title" && typeof parsed.title === "string") {
-				title = parsed.title;
-				continue;
-			}
-			if (parsed.type === "session") {
-				if (title === null && typeof parsed.title === "string") title = parsed.title;
-				if (typeof parsed.cwd === "string") cwd = parsed.cwd;
-				break;
-			}
-		}
-	} catch {
-		// Unreadable head (gc'd, gz, permission) → keep the row with path-derived metadata.
-	}
-	const metadata = { mtimeMs, title, cwd };
-	metadataCache.set(file, metadata);
-	return metadata;
 }
 
 interface SummaryFold extends SessionSummary {
 	modelSet: Set<string>;
 }
+
 /** Parse the ms timestamp from a session basename (`2026-09-01T10-24-49-741Z_<uuid>.jsonl`). */
 function basenameTimestamp(base: string): number | undefined {
 	const match = /^(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})-(\d{3})Z_/.exec(base);
 	if (!match) return undefined;
 	const ms = Date.parse(`${match[1]}T${match[2]}:${match[3]}:${match[4]}.${match[5]}Z`);
 	return Number.isFinite(ms) ? ms : undefined;
+}
+
+/**
+ * The root transcript a stored transcript belongs to: itself, unless it is
+ * nested below `<root>/<project>/<session>/`, where it is a child of
+ * `<root>/<project>/<session>.jsonl`. Null for a path outside every session root.
+ */
+function rootTranscriptOf(file: string): { rootFile: string; isChild: boolean } | null {
+	const sessionRoot = findSessionRoot(file);
+	const rel = path.relative(sessionRoot, file);
+	if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) return null;
+	const segments = rel.split(path.sep);
+	if (segments.length <= 2) return { rootFile: file, isChild: false };
+	return { rootFile: path.join(sessionRoot, segments[0], `${segments[1]}.jsonl`), isChild: true };
 }
 
 /**
@@ -1238,7 +1033,7 @@ function basenameTimestamp(base: string): number | undefined {
 let diskRootsMemo:
 	| {
 			atMs: number;
-			sessionsDir: string;
+			sessionRoots: string;
 			limit: number;
 			roots: Array<{ file: string; mtimeMs: number; startedAt: number }>;
 	  }
@@ -1247,36 +1042,44 @@ const DISK_ROOTS_TTL_MS = 5_000;
 
 async function scanDiskRoots(limit: number): Promise<Array<{ file: string; mtimeMs: number; startedAt: number }>> {
 	const now = Date.now();
-	const sessionsDir = getSessionsDir();
+	const sessionRoots = getSessionRoots();
+	const memoKey = sessionRoots.join("\0");
 	const memo = diskRootsMemo;
-	if (memo && memo.sessionsDir === sessionsDir && memo.limit >= limit && now - memo.atMs < DISK_ROOTS_TTL_MS) {
+	if (memo && memo.sessionRoots === memoKey && memo.limit >= limit && now - memo.atMs < DISK_ROOTS_TTL_MS) {
 		return memo.roots.slice(0, limit);
 	}
-	let projects: string[] = [];
-	try {
-		projects = await fs.readdir(sessionsDir);
-	} catch (err) {
-		if (isEnoent(err)) return [];
-		throw err;
-	}
 	const roots: Array<{ file: string; mtimeMs: number; startedAt: number }> = [];
+	const addTranscripts = async (dir: string, names: readonly string[]): Promise<void> => {
+		await Promise.all(
+			names.map(async name => {
+				if (!name.endsWith(".jsonl")) return;
+				const file = path.join(dir, name);
+				try {
+					const stat = await fs.stat(file);
+					roots.push({ file, mtimeMs: stat.mtimeMs, startedAt: basenameTimestamp(name) ?? stat.mtimeMs });
+				} catch {
+					// Deleted meanwhile — skip.
+				}
+			}),
+		);
+	};
 	await Promise.all(
-		projects.map(async project => {
-			let names: string[] = [];
+		sessionRoots.map(async sessionRoot => {
+			let names: string[];
 			try {
-				names = await fs.readdir(path.join(sessionsDir, project));
+				names = await fs.readdir(sessionRoot);
 			} catch {
-				return; // Not a directory or unreadable — skip.
+				return; // The root does not exist yet.
 			}
+			// A custom session dir holds transcripts directly; the default one has a folder per project.
+			await addTranscripts(sessionRoot, names);
 			await Promise.all(
-				names.map(async name => {
-					if (!name.endsWith(".jsonl") && !name.endsWith(".jsonl.gz")) return;
-					const file = path.join(sessionsDir, project, name);
+				names.map(async project => {
+					if (project.endsWith(".jsonl")) return;
 					try {
-						const stat = await fs.stat(file);
-						roots.push({ file, mtimeMs: stat.mtimeMs, startedAt: basenameTimestamp(name) ?? stat.mtimeMs });
+						await addTranscripts(path.join(sessionRoot, project), await fs.readdir(path.join(sessionRoot, project)));
 					} catch {
-						// Raced with gc — skip.
+						// Not a directory or unreadable — skip.
 					}
 				}),
 			);
@@ -1284,50 +1087,45 @@ async function scanDiskRoots(limit: number): Promise<Array<{ file: string; mtime
 	);
 	roots.sort((a, b) => b.mtimeMs - a.mtimeMs);
 	const newest = roots.slice(0, limit);
-	diskRootsMemo = { atMs: Date.now(), sessionsDir, limit, roots: newest };
+	diskRootsMemo = { atMs: Date.now(), sessionRoots: memoKey, limit, roots: newest };
 	return newest.slice();
 }
 
 /**
  * List root sessions for the Traces section, folding every synced child
- * transcript (subagents, advisors) into its root row.
+ * transcript into its root row.
  */
 export async function listSessionSummaries(limit = 100, q?: string): Promise<SessionSummary[]> {
 	// The Traces page may be the first thing a dashboard serves.
 	await initDb();
-	const sessionsDir = getSessionsDir();
 	const byRoot = new Map<string, SummaryFold>();
+	const emptyFold = (file: string, startedAt: number, endedAt: number): SummaryFold => ({
+		file,
+		folder: extractFolderFromPath(file),
+		title: null,
+		startedAt,
+		endedAt,
+		requests: 0,
+		toolCalls: 0,
+		subagents: 0,
+		totalTokens: 0,
+		costTotal: 0,
+		unpricedRequests: 0,
+		models: [],
+		modelSet: new Set(),
+	});
 
 	for (const row of getSessionRollups()) {
-		const rel = path.relative(sessionsDir, row.sessionFile);
-		if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) continue;
-		const segments = rel.split(path.sep);
-		if (segments.length < 2) continue;
-		const isChild = segments.length > 2;
-		const rootFile = isChild ? path.join(sessionsDir, segments[0], `${segments[1]}.jsonl`) : row.sessionFile;
-
-		let fold = byRoot.get(rootFile);
+		const owner = rootTranscriptOf(row.sessionFile);
+		if (!owner) continue;
+		let fold = byRoot.get(owner.rootFile);
 		if (!fold) {
-			fold = {
-				file: rootFile,
-				folder: extractFolderFromPath(rootFile),
-				title: null,
-				startedAt: row.startedAt,
-				endedAt: row.endedAt,
-				requests: 0,
-				toolCalls: 0,
-				subagents: 0,
-				totalTokens: 0,
-				costTotal: 0,
-				unpricedRequests: 0,
-				models: [],
-				modelSet: new Set(),
-			};
-			byRoot.set(rootFile, fold);
+			fold = emptyFold(owner.rootFile, row.startedAt, row.endedAt);
+			byRoot.set(owner.rootFile, fold);
 		}
 		fold.requests += row.requests;
 		fold.toolCalls += row.toolCalls;
-		if (isChild) fold.subagents++;
+		if (owner.isChild) fold.subagents++;
 		if (row.startedAt < fold.startedAt) fold.startedAt = row.startedAt;
 		if (row.endedAt > fold.endedAt) fold.endedAt = row.endedAt;
 		fold.totalTokens += row.totalTokens ?? 0;
@@ -1349,29 +1147,18 @@ export async function listSessionSummaries(limit = 100, q?: string): Promise<Ses
 			if (root.mtimeMs > existing.endedAt) existing.endedAt = root.mtimeMs;
 			continue;
 		}
-		byRoot.set(root.file, {
-			file: root.file,
-			folder: extractFolderFromPath(root.file),
-			title: null,
-			startedAt: root.startedAt,
-			endedAt: root.mtimeMs,
-			requests: 0,
-			toolCalls: 0,
-			subagents: 0,
-			totalTokens: 0,
-			costTotal: 0,
-			unpricedRequests: 0,
-			models: [],
-			modelSet: new Set(),
-		});
+		byRoot.set(root.file, emptyFold(root.file, root.startedAt, root.mtimeMs));
 	}
 
 	const folds = [...byRoot.values()].sort((a, b) => b.endedAt - a.endedAt).slice(0, LIST_FOLD_LIMIT);
+	// The sync cursor already holds each indexed session's folder and title; only unindexed files are read.
+	const cursors = getFileOffsets(folds.map(fold => fold.file));
 	await Promise.all(
 		folds.map(async fold => {
-			const metadata = await readSessionMetadata(fold.file);
-			fold.title = metadata.title;
-			fold.folder = metadata.cwd ?? extractFolderFromPath(fold.file);
+			const state = cursors.get(fold.file)?.parserState;
+			fold.title = state?.sessionName ?? state?.firstPrompt ?? null;
+			const cwd = state ? state.folder : await readHeaderCwd(fold.file);
+			if (cwd) fold.folder = projectFolder(cwd);
 			fold.models = [...fold.modelSet].sort();
 		}),
 	);

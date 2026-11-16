@@ -68,17 +68,23 @@ describe("non-message usage", () => {
 		]);
 	});
 
-	it("maps durationMs to the duration and leaves the time to first token unknown", async () => {
+	it("takes the duration from durationMs, else from the two timestamps, and leaves the TTFT unknown", async () => {
 		const file = await writeSession(sessionPath(), [
 			assistant("timed", { message: { durationMs: 4_200 } }),
-			assistant("legacy", { timestamp: T0 + 1 }),
+			// Older pi: no durationMs, but the request start and the persist time are both recorded.
+			{ ...assistant("legacy", { timestamp: T0 + 10_000 }), timestamp: new Date(T0 + 12_500).toISOString() },
+			// Out of order or missing ends give no duration rather than a made-up one.
+			{ ...assistant("skewed", { timestamp: T0 + 20_000 }), timestamp: new Date(T0 + 19_000).toISOString() },
+			assistant("no-start", { timestamp: T0 + 30_000, message: { timestamp: undefined } }),
 		]);
 
 		const result = await parseSessionFile(file);
 
 		expect(result.stats.map(s => [s.entryId, s.duration, s.ttft])).toEqual([
 			["timed", 4_200, null],
-			["legacy", null, null],
+			["legacy", 2_500, null],
+			["skewed", null, null],
+			["no-start", null, null],
 		]);
 	});
 
