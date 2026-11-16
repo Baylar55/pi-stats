@@ -1,24 +1,18 @@
-import { afterEach, describe, expect, it } from "bun:test";
-import {
-	type JudgmentRequest,
-	type JudgmentResult,
-	type Model,
-	type Questions,
-	type ScoreAnswer,
-	tokenUsage,
-} from "@oh-my-pi/pi-ai";
-import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
-import { initDb, insertUserMessageStats, upsertFrustrationVerdicts } from "@oh-my-pi/omp-stats/db";
+import { afterEach, describe, expect, it } from "vitest";
+import { initDb, insertUserMessageStats, upsertFrustrationVerdicts } from "../src/db";
 import {
 	cancelFrustrationRun,
 	estimateFrustrationRun,
 	getFrustrationDashboardStats,
 	getFrustrationJobStatus,
 	type StatsJudge,
+	type StatsJudgeModel,
 	setStatsJudgeProvider,
 	startFrustrationRun,
-} from "@oh-my-pi/omp-stats/frustration";
-import type { UserMessageStats } from "@oh-my-pi/omp-stats/types";
+} from "../src/frustration";
+import { type JudgeCompletion, type JudgePrompt, parseFrustrationReply, renderFrustrationPrompt } from "../src/judge";
+import type { UserMessageStats } from "../src/types";
+import { hashHex, sleep } from "../src/util";
 import { installStatsTestIsolation } from "./helpers/temp-agent";
 
 installStatsTestIsolation("@pi-stats-frustration-");
@@ -34,7 +28,7 @@ type Signals = Partial<
 let entrySeq = 0;
 
 function hashOf(prose: string): string {
-	return prose ? Bun.hash(prose).toString(16) : "";
+	return prose ? hashHex(prose) : "";
 }
 
 function userMessage(
@@ -67,27 +61,14 @@ function userMessage(
 
 function verdict(prose: string, pAnnoyed: number, pAngry: number, target: string): void {
 	upsertFrustrationVerdicts([
-		{
-			proseHash: hashOf(prose),
-			pAnnoyed,
-			pAngry,
-			target,
-			judge: "test/judge",
-			judgedAt: Date.now(),
-		},
+		{ proseHash: hashOf(prose), pAnnoyed, pAngry, target, judge: "test/judge", judgedAt: Date.now() },
 	]);
-}
-
-function testModel(): Model {
-	const bundled = getBundledModel("openai", "gpt-5.4");
-	if (!bundled) throw new Error("fixture model missing from catalog");
-	return { ...bundled, cost: { ...bundled.cost, input: 1, output: 2 } };
 }
 
 /** Judge answering every text "angry at the assistant"; `gate` holds requests until released or aborted. */
 class FakeJudge implements StatsJudge {
-	readonly label = "fake";
 	readonly states: string[] = [];
+	readonly modelsUsed = new Set<string>();
 	readonly #entered = Promise.withResolvers<void>();
 	/** Resolves when the first judgment starts. */
 	readonly entered = this.#entered.promise;
@@ -97,51 +78,34 @@ class FakeJudge implements StatsJudge {
 	delayMs = 0;
 	inFlight = 0;
 	maxInFlight = 0;
+	/** Replies handed out before the well-formed one. */
+	garbage: string[] = [];
 
-	primaryModel(): Model | undefined {
-		return testModel();
+	models(): StatsJudgeModel[] {
+		return [{ id: "openai/gpt-x", inputPrice: 1, outputPrice: 2 }, { id: "sub/free-model" }];
 	}
 
-	async judge<Q extends Questions>(
-		request: JudgmentRequest<Q>,
-		options: { signal?: AbortSignal } = {},
-	): Promise<JudgmentResult<Q>> {
-		if (typeof request.state === "string") this.states.push(request.state);
+	async complete(model: string, prompt: JudgePrompt, signal: AbortSignal): Promise<JudgeCompletion> {
+		this.modelsUsed.add(model);
+		const state = /<state>\n([\s\S]*)\n<\/state>/.exec(prompt.user)?.[1];
+		if (state !== undefined) this.states.push(state);
 		this.#entered.resolve();
 		this.inFlight++;
 		this.maxInFlight = Math.max(this.maxInFlight, this.inFlight);
 		try {
 			if (this.inFlight > this.capacity) throw new Error("429 rate limited");
-			if (this.delayMs) await Bun.sleep(this.delayMs);
+			if (this.delayMs) await sleep(this.delayMs);
 		} finally {
 			this.inFlight--;
 		}
 		if (this.gate) {
-			const signal = options.signal;
 			await Promise.race([
 				this.gate,
-				new Promise<never>((_, reject) => signal?.addEventListener("abort", () => reject(signal.reason))),
+				new Promise<never>((_, reject) => signal.addEventListener("abort", () => reject(signal.reason))),
 			]);
 		}
-		const annoyed: ScoreAnswer = {
-			type: "score",
-			score: 2.5,
-			probabilities: { "0": 0.05, "1": 0.05, "2": 0.3, "3": 0.6 },
-			confidence: 0.6,
-		};
-		const target = {
-			type: "choice",
-			choice: "assistant",
-			probabilities: { assistant: 0.9, other: 0.05, none: 0.05 },
-			confidence: 0.9,
-		};
-		return {
-			api: "typesafe",
-			provider: "fake",
-			model: "judge-1",
-			answers: { annoyed, target } as JudgmentResult<Q>["answers"],
-			usage: tokenUsage(600, 0, 0.001),
-		};
+		const garbage = this.garbage.shift();
+		return { text: garbage ?? "annoyed: 3\ntarget: assistant", cost: 0.001 };
 	}
 }
 
@@ -150,19 +114,19 @@ describe("frustration dashboard", () => {
 		await initDb();
 		insertUserMessageStats([
 			// Regex says at-assistant, the verdict says neutral: the verdict wins.
-			userMessage("no, stop doing that", "gpt-5.4", "openai", { negation: 1 }),
+			userMessage("no, stop doing that", "gpt-x", "openai", { negation: 1 }),
 			// Regex: yelling + blame → annoyed, at assistant, angry.
-			userMessage("WHY DID YOU DELETE IT", "gpt-5.4", "openai", { yelling: 1, blame: 1 }),
+			userMessage("WHY DID YOU DELETE IT", "gpt-x", "openai", { yelling: 1, blame: 1 }),
 			// Regex: anguish alone → annoyed, not at the assistant.
-			userMessage("ugh this build tool", "gpt-5.4", "openai", { anguish: 1 }),
+			userMessage("ugh this build tool", "gpt-x", "openai", { anguish: 1 }),
 			// Regex: profanity without negation/repetition/blame is not aimed at the assistant.
-			userMessage("damn flaky ci", "gpt-5.4", "openai", { profanity: 1 }),
+			userMessage("damn flaky ci", "gpt-x", "openai", { profanity: 1 }),
 			// Verdict: annoyed at something else, even though it sounds hostile.
-			userMessage("the library is broken", "gpt-5.4", "openai"),
+			userMessage("the library is broken", "gpt-x", "openai"),
 			// Verdict: annoyed at the assistant but not angry.
-			userMessage("you missed the file again", "gpt-5.4", "openai"),
+			userMessage("you missed the file again", "gpt-x", "openai"),
 			// No prose (markup only): excluded everywhere.
-			userMessage("", "gpt-5.4", "openai", { yelling: 1 }),
+			userMessage("", "gpt-x", "openai", { yelling: 1 }),
 			// Never answered: overall only.
 			userMessage("HELLO??? ANYONE", null, null, { yelling: 1 }),
 		]);
@@ -175,7 +139,7 @@ describe("frustration dashboard", () => {
 		expect(stats.overall).toEqual({ messages: 7, judged: 3, annoyed: 6, atAssistant: 2, angry: 1 });
 		expect(stats.byModel).toHaveLength(1);
 		expect(stats.byModel[0]).toMatchObject({
-			label: "gpt 5.4",
+			label: "gpt-x",
 			messages: 6,
 			judged: 3,
 			annoyed: 5,
@@ -185,72 +149,22 @@ describe("frustration dashboard", () => {
 		expect(stats.judgeAvailable).toBe(false);
 	});
 
-	it("merges provider/spelling variants and orders by class, revision, then family", async () => {
+	it("merges the same model across providers and orders rows by first use", async () => {
 		await initDb();
 		const t = Date.now() - 60_000;
 		insertUserMessageStats([
 			userMessage("a", "weird-model", "custom", {}, t),
-			userMessage("b", "gpt-5.4", "openai", {}, t + 1),
-			userMessage("c", "claude-opus-5-5", "anthropic", {}, t + 2),
-			userMessage("d", "claude-opus-5", "anthropic", {}, t + 3),
-			userMessage("e", "claude-fable-5", "anthropic", {}, t + 4),
-			userMessage("f", "claude-opus-4-8", "anthropic", {}, t + 5),
-			userMessage("g", "claude-opus-4-6", "anthropic", {}, t + 6),
-			userMessage("h", "claude-opus-4.6", "anthropic", {}, t + 7),
+			userMessage("b", "gpt-x", "openai", {}, t + 1),
+			userMessage("c", "gpt-x", "openai-codex", {}, t + 2),
 		]);
 
 		const { byModel } = await getFrustrationDashboardStats("all");
 
-		expect(byModel.map(row => row.label)).toEqual([
-			"opus 4.6",
-			"opus 4.8",
-			"fable 5",
-			"opus 5",
-			"opus 5.5",
-			"gpt 5.4",
-			"weird-model",
+		expect(byModel.map(row => [row.key, row.messages, row.firstSeen])).toEqual([
+			["weird-model", 1, t],
+			["gpt-x", 2, t + 1],
 		]);
-		expect(byModel[0]).toMatchObject({
-			key: "anthropic/opus/4.6.0",
-			modelClass: "anthropic",
-			family: "opus",
-			revision: "4.6.0",
-			messages: 2,
-			firstSeen: t + 6,
-		});
-		expect(byModel[0].models.toSorted()).toEqual(["claude-opus-4-6", "claude-opus-4.6"]);
-		expect(byModel.at(-1)).toMatchObject({ key: "weird-model", modelClass: "unknown", revision: null });
-	});
-
-	it("groups DeepSeek Flash aliases and V4 provider variants without merging Pro or V4.1 into V4", async () => {
-		await initDb();
-		const t = Date.now() - 60_000;
-		insertUserMessageStats([
-			userMessage("flash free", "deepseek-v4-flash-free", "opencode-zen", {}, t),
-			userMessage("flash openrouter", "deepseek/deepseek-v4-flash-0731", "openrouter", {}, t + 1),
-			userMessage("flash cline", "deepseek-v4-flash", "cline-pass", {}, t + 2),
-			userMessage("flash crofai", "deepseek-v4-flash-0731", "crofai", {}, t + 3),
-			userMessage("flash prefixed", "cline-free/deepseek-v4-flash", "cline-pass", {}, t + 4),
-			userMessage("pro", "deepseek-v4-pro", "cline-pass", {}, t + 5),
-			userMessage("flash v4.1", "deepseek-v4.1-flash", "cline-pass", {}, t + 6),
-			userMessage("flash native alias", "deepseek-flash", "deepseek", {}, t + 7),
-			userMessage("flash opencode alias", "deepseek-flash", "opencode-go", {}, t + 8),
-		]);
-
-		const { byModel } = await getFrustrationDashboardStats("all");
-		expect(byModel.map(row => [row.key, row.label, row.messages])).toEqual([
-			["deepseek/flash/4.0.0", "flash 4", 5],
-			["deepseek/pro/4.0.0", "pro 4", 1],
-			["deepseek/flash/4.1.0", "flash 4.1", 3],
-		]);
-		expect(byModel[0].models.toSorted()).toEqual([
-			"cline-free/deepseek-v4-flash",
-			"deepseek-v4-flash",
-			"deepseek-v4-flash-0731",
-			"deepseek-v4-flash-free",
-			"deepseek/deepseek-v4-flash-0731",
-		]);
-		expect(byModel[2].models.toSorted()).toEqual(["deepseek-flash", "deepseek-v4.1-flash"]);
+		expect(byModel[1]).toMatchObject({ label: "gpt-x", modelClass: "unknown", revision: null, models: ["gpt-x"] });
 	});
 
 	it("quotes and runs the judge once per unique unjudged prose, streaming verdicts into the dashboard", async () => {
@@ -259,10 +173,10 @@ describe("frustration dashboard", () => {
 		const single = "please rename it";
 		const judged = "already judged text";
 		insertUserMessageStats([
-			userMessage(repeated, "gpt-5.4", "openai"),
-			userMessage(repeated, "gpt-5.4", "openai"),
-			userMessage(single, "gpt-5.4", "openai"),
-			userMessage(judged, "gpt-5.4", "openai"),
+			userMessage(repeated, "gpt-x", "openai"),
+			userMessage(repeated, "gpt-x", "openai"),
+			userMessage(single, "gpt-x", "openai"),
+			userMessage(judged, "gpt-x", "openai"),
 		]);
 		verdict(judged, 0, 0, "none");
 		const judge = new FakeJudge();
@@ -277,8 +191,11 @@ describe("frustration dashboard", () => {
 			chars,
 			inputTokens,
 			cost: (inputTokens * 1) / 1e6 + (2 * 8 * 2) / 1e6,
-			judge: "openai/gpt-5.4",
+			judge: "openai/gpt-x",
+			models: ["openai/gpt-x", "sub/free-model"],
 		});
+		// Asking for a quote never calls the model.
+		expect(judge.states).toEqual([]);
 
 		const started = await startFrustrationRun("all");
 		if (!started.started) throw new Error(started.error);
@@ -291,7 +208,7 @@ describe("frustration dashboard", () => {
 			done: 2,
 			failed: 0,
 			cost: 0.002,
-			judge: "fake/judge-1",
+			judge: "openai/gpt-x",
 		});
 		const stats = await getFrustrationDashboardStats("all");
 		expect(stats.overall).toEqual({ messages: 4, judged: 4, annoyed: 3, atAssistant: 3, angry: 3 });
@@ -299,9 +216,42 @@ describe("frustration dashboard", () => {
 		expect(await estimateFrustrationRun("all")).toMatchObject({ available: true, messages: 0 });
 	});
 
+	it("judges with the model picked in the dashboard and quotes no price for an unpriced one", async () => {
+		await initDb();
+		insertUserMessageStats([userMessage("stop it", "gpt-x", "openai")]);
+		const judge = new FakeJudge();
+		setStatsJudgeProvider(async () => judge);
+
+		expect(await estimateFrustrationRun("all", "sub/free-model")).toMatchObject({ judge: "sub/free-model", cost: null });
+		// An id the host does not offer falls back to its default.
+		expect(await estimateFrustrationRun("all", "nope/nope")).toMatchObject({ judge: "openai/gpt-x" });
+
+		const started = await startFrustrationRun("all", "sub/free-model");
+		if (!started.started) throw new Error(started.error);
+		await started.finished;
+
+		expect([...judge.modelsUsed]).toEqual(["sub/free-model"]);
+		expect(getFrustrationJobStatus()).toMatchObject({ state: "done", judge: "sub/free-model" });
+	});
+
+	it("re-asks when a reply does not parse", async () => {
+		await initDb();
+		insertUserMessageStats([userMessage("why is it broken again", "gpt-x", "openai")]);
+		const judge = new FakeJudge();
+		judge.garbage = ["I think the user is rather upset."];
+		setStatsJudgeProvider(async () => judge);
+
+		const started = await startFrustrationRun("all");
+		if (!started.started) throw new Error(started.error);
+		await started.finished;
+
+		expect(judge.states).toHaveLength(2);
+		expect(getFrustrationJobStatus()).toMatchObject({ state: "done", done: 1, failed: 0, cost: 0.002 });
+	});
+
 	it("refuses a second run while one is active and cancels in-flight judgments", async () => {
 		await initDb();
-		insertUserMessageStats([userMessage("stop it", "gpt-5.4", "openai")]);
+		insertUserMessageStats([userMessage("stop it", "gpt-x", "openai")]);
 		const judge = new FakeJudge();
 		const { promise: gate } = Promise.withResolvers<void>();
 		judge.gate = gate;
@@ -323,7 +273,7 @@ describe("frustration dashboard", () => {
 	it("raises concurrency past its starting point, rides out rate limits, and persists every verdict", async () => {
 		await initDb();
 		const texts = Array.from({ length: 400 }, (_, i) => `text number ${i}`);
-		insertUserMessageStats(texts.map(text => userMessage(text, "gpt-5.4", "openai")));
+		insertUserMessageStats(texts.map(text => userMessage(text, "gpt-x", "openai")));
 		const judge = new FakeJudge();
 		judge.delayMs = 5;
 		judge.capacity = 64;
@@ -340,7 +290,38 @@ describe("frustration dashboard", () => {
 	});
 
 	it("reports why a run is unavailable without a host judge", async () => {
-		expect(await estimateFrustrationRun("all")).toMatchObject({ available: false });
+		const estimate = await estimateFrustrationRun("all");
+		expect(estimate).toMatchObject({ available: false });
+		// The standalone bin has no judge; the page shows this reason.
+		expect(estimate.available ? "" : estimate.reason).toContain("standalone pi-stats");
 		expect(await startFrustrationRun("all")).toMatchObject({ started: false, status: 503 });
+	});
+});
+
+describe("judge reply parsing", () => {
+	it("reads one answer line per question, tolerant of formatting noise", () => {
+		expect(parseFrustrationReply("annoyed: 2\ntarget: assistant")).toEqual({ annoyed: 2, target: "assistant" });
+		expect(parseFrustrationReply("Sure!\n- `annoyed` = level 1.\n* target - other (the build tool)")).toEqual({
+			annoyed: 1,
+			target: "other",
+		});
+		expect(parseFrustrationReply("annoyed: 0\ntarget: none")).toEqual({ annoyed: 0, target: "none" });
+	});
+
+	it("rejects replies missing an answer or naming no valid level", () => {
+		expect(parseFrustrationReply("annoyed: 2")).toBeUndefined();
+		expect(parseFrustrationReply("annoyed: 7\ntarget: assistant")).toBeUndefined();
+		expect(parseFrustrationReply("annoyed: very\ntarget: assistant")).toBeUndefined();
+		expect(parseFrustrationReply("annoyed: 1.5\ntarget: nobody")).toBeUndefined();
+	});
+
+	it("keeps the rubric in the system prompt and the text in the user prompt", () => {
+		const prompt = renderFrustrationPrompt("why did you do that");
+		expect(prompt.system).toContain("Question `annoyed`");
+		expect(prompt.system).toContain("- `3`: angry, hostile, or swearing");
+		expect(prompt.system).toContain("Answer with exactly one of: `assistant`, `other`, `none`.");
+		expect(prompt.system).not.toContain("why did you do that");
+		expect(prompt.user).toContain("<state>\nwhy did you do that\n</state>");
+		expect(renderFrustrationPrompt("x", true).system).toContain("Classification retry");
 	});
 });

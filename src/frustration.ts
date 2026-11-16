@@ -3,7 +3,7 @@
  * annoyed at the assistant, and angry at the assistant.
  *
  * Each message is classified by its cached judge verdict when one exists:
- *   annoyed     = P(level 2) + P(level 3) ≥ 0.5 on {@link FRUSTRATION_QUESTIONS}.annoyed
+ *   annoyed     = P(level 2) + P(level 3) ≥ 0.5 on the rubric's `annoyed` question
  *   atAssistant = annoyed && target = `assistant`
  *   angry       = atAssistant && P(level 3) ≥ 0.5
  * and otherwise by the regex signals stored at ingest (`user-metrics.ts`):
@@ -13,14 +13,9 @@
  * The SQL implementing both lives in `db.ts` (`FRUSTRATION_COUNTS_SQL`).
  *
  * Verdicts come from a single process-wide judge run over the unjudged prose,
- * using the judge the omp host registered through `startServer`. Standalone
- * `omp-stats` has none and only shows the regex fallback.
+ * using the judge the pi extension registered. The standalone `pi-stats` bin
+ * has none and only shows the regex fallback.
  */
-import { type Judge, judgeQuestions, type Model } from "@oh-my-pi/pi-ai";
-import { compareRevision, parseRevision } from "@oh-my-pi/pi-catalog/compat/revision";
-import { classifyModel } from "@oh-my-pi/pi-catalog/compat/taxonomy";
-import { getEffectiveTokenCost } from "@oh-my-pi/pi-catalog/models";
-import { logger } from "@oh-my-pi/pi-utils";
 import { getTimeRangeConfig } from "./aggregator";
 import {
 	type FrustrationModelRow,
@@ -33,35 +28,39 @@ import {
 	type PendingProse,
 	upsertFrustrationVerdicts,
 } from "./db";
-import questionFile from "./prompts/judge/frustration.json" with { type: "json" };
+import { type JudgeCompletion, type JudgePrompt, judgeFrustration } from "./judge";
 import type {
 	FrustrationDashboardStats,
 	FrustrationEstimate,
 	FrustrationJobStatus,
 	FrustrationModelStats,
 } from "./shared-types";
+import { logger, sleep } from "./util";
 
-/** Judge supplied by the omp host process; `primaryModel` prices the pre-run estimate. */
-export interface StatsJudge extends Judge {
-	primaryModel(): Model | undefined;
+/** A model the host can judge with. Prices are USD per 1M tokens; absent when the model has no public price. */
+export interface StatsJudgeModel {
+	/** `provider/model`. */
+	id: string;
+	inputPrice?: number;
+	outputPrice?: number;
 }
 
-/** Lazily resolves the host judge on first estimate/run so `omp stats` startup stays fast. */
+/** Judge supplied by the pi host process: chat completions through its model registry. */
+export interface StatsJudge {
+	/** Models the host can judge with; the first is the default. */
+	models(): StatsJudgeModel[];
+	/** One chat completion. Rejects on provider error or abort. */
+	complete(model: string, prompt: JudgePrompt, signal: AbortSignal): Promise<JudgeCompletion>;
+}
+
+/** Lazily resolves the host judge on first estimate/run so starting the dashboard stays fast. */
 export type StatsJudgeProvider = () => Promise<StatsJudge>;
 
-/**
- * The two questions asked about every prose text, in ONE judge request:
- * `annoyed` (four levels) and `target` (`assistant`, `other`, or `none`).
- * The cost constants below were measured with exactly these strings; changing
- * them invalidates both the estimate and every cached verdict's meaning.
- */
-export const FRUSTRATION_QUESTIONS = judgeQuestions(questionFile);
-
-/** Per-request input-token overhead of {@link FRUSTRATION_QUESTIONS}, measured on jev-1.13. */
+/** Per-request input-token overhead of the rubric prompt, measured by omp on jev-1.13. */
 const REQUEST_OVERHEAD_TOKENS = 561;
-/** Prose characters per input token, measured on jev-1.13. */
+/** Prose characters per input token, measured by omp on jev-1.13. */
 const CHARS_PER_TOKEN = 5.9;
-/** Output tokens a prompted chat judge bills per request; native judges bill none (zero output price). */
+/** Output tokens a prompted chat judge bills per request. */
 const OUTPUT_TOKENS_PER_REQUEST = 8;
 /** Judge requests in flight at the start of a run; {@link AdaptiveLimit} tunes it from there. */
 const INITIAL_CONCURRENCY = 32;
@@ -79,8 +78,8 @@ const ATTEMPTS_PER_TEXT = 3;
 const CIRCUIT_BREAKER_FAILURES = 25;
 
 const NO_PROVIDER_REASON =
-	"This dashboard was started without a judge (standalone omp-stats). Run `omp stats` to classify.";
-const NO_MODEL_REASON = "No judge model is available. Configure the `judge` model role.";
+	"This dashboard was started without a judge (standalone pi-stats). Run /stats inside pi to classify.";
+const NO_MODEL_REASON = "No judge model is available. Select a model in pi first.";
 
 let judgeProvider: StatsJudgeProvider | undefined;
 let judgePromise: Promise<StatsJudge> | undefined;
@@ -102,7 +101,7 @@ let currentController: AbortController | undefined;
 /** Set while a start request is resolving the judge / loading the queue, so a concurrent start gets 409. */
 let starting = false;
 
-/** Register (or replace) the host judge. Called by `startServer`. */
+/** Register (or replace) the host judge. */
 export function setStatsJudgeProvider(provider: StatsJudgeProvider | undefined): void {
 	judgeProvider = provider;
 	judgePromise = undefined;
@@ -123,24 +122,26 @@ function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
+/** The requested judge model when the host offers it, else the host's default. */
+function pickModel(models: readonly StatsJudgeModel[], requested?: string | null): StatsJudgeModel | undefined {
+	return (requested ? models.find(model => model.id === requested) : undefined) ?? models[0];
+}
+
 /** Snapshot of the current run's progress. */
 export function getFrustrationJobStatus(): FrustrationJobStatus {
 	return { ...currentJob };
 }
 
 /**
- * Merge per-(model, provider) rows into catalog identities (`class/family/revision`)
- * so provider and spelling variants share a row. Classified rows sort by class,
- * then revision ascending, then family; unclassified rows follow by first use.
+ * Merge per-(model, provider) rows into one row per model id, so the same
+ * model reached through several providers shares a row; rows sort by first
+ * use. omp merges by its catalog's `class/family/revision` identity, which pi
+ * has no equivalent of, so the identity fields stay unclassified.
  */
 export function mergeFrustrationRows(rows: readonly FrustrationModelRow[]): FrustrationModelStats[] {
 	const merged = new Map<string, FrustrationModelStats>();
 	for (const row of rows) {
-		const identity = classifyModel(row.provider ?? "", row.model, { lenient: true });
-		const classified = identity.class !== "unknown" && identity.revision !== undefined;
-		const family = identity.family ?? null;
-		const key = classified ? `${identity.class}/${family ?? ""}/${identity.revision}` : row.model;
-		const existing = merged.get(key);
+		const existing = merged.get(row.model);
 		if (existing) {
 			existing.messages += row.messages;
 			existing.judged += row.judged;
@@ -148,18 +149,14 @@ export function mergeFrustrationRows(rows: readonly FrustrationModelRow[]): Frus
 			existing.atAssistant += row.atAssistant;
 			existing.angry += row.angry;
 			existing.firstSeen = Math.min(existing.firstSeen, row.firstSeen);
-			if (!existing.models.includes(row.model)) existing.models.push(row.model);
 			continue;
 		}
-		const revision = classified ? (identity.revision ?? null) : null;
-		// `4.5.0` → `4.5`, `5.0.0` → `5`.
-		const shortRevision = revision?.replace(/(?:\.0)+$/, "");
-		merged.set(key, {
-			key,
-			label: shortRevision ? [family, shortRevision].filter(Boolean).join(" ") : row.model,
-			modelClass: identity.class,
-			family,
-			revision,
+		merged.set(row.model, {
+			key: row.model,
+			label: row.model,
+			modelClass: "unknown",
+			family: null,
+			revision: null,
 			models: [row.model],
 			firstSeen: row.firstSeen,
 			messages: row.messages,
@@ -169,23 +166,7 @@ export function mergeFrustrationRows(rows: readonly FrustrationModelRow[]): Frus
 			angry: row.angry,
 		});
 	}
-	return [...merged.values()].sort(compareModelStats);
-}
-
-function compareModelStats(a: FrustrationModelStats, b: FrustrationModelStats): number {
-	const aRevision = a.revision ? parseRevision(a.revision) : undefined;
-	const bRevision = b.revision ? parseRevision(b.revision) : undefined;
-	if (!aRevision || !bRevision) {
-		if (aRevision) return -1;
-		if (bRevision) return 1;
-		return a.firstSeen - b.firstSeen;
-	}
-	if (a.modelClass !== b.modelClass) return a.modelClass < b.modelClass ? -1 : 1;
-	const byRevision = compareRevision(aRevision, bRevision);
-	if (byRevision !== 0) return byRevision;
-	const aFamily = a.family ?? "";
-	const bFamily = b.family ?? "";
-	return aFamily < bFamily ? -1 : aFamily > bFamily ? 1 : 0;
+	return [...merged.values()].sort((a, b) => a.firstSeen - b.firstSeen);
 }
 
 /** Payload of `GET /api/stats/frustration`. */
@@ -200,8 +181,11 @@ export async function getFrustrationDashboardStats(range?: string | null): Promi
 	};
 }
 
-/** Pre-run cost quote for judging every unjudged prose text in range. */
-export async function estimateFrustrationRun(range?: string | null): Promise<FrustrationEstimate> {
+/** Pre-run cost quote for judging every unjudged prose text in range with `model` (default: the host's first). */
+export async function estimateFrustrationRun(
+	range?: string | null,
+	model?: string | null,
+): Promise<FrustrationEstimate> {
 	if (!judgeProvider) return { available: false, reason: NO_PROVIDER_REASON };
 	let judge: StatsJudge;
 	try {
@@ -209,15 +193,27 @@ export async function estimateFrustrationRun(range?: string | null): Promise<Fru
 	} catch (error) {
 		return { available: false, reason: `The judge could not be loaded: ${errorMessage(error)}` };
 	}
-	const model = judge.primaryModel();
-	if (!model) return { available: false, reason: NO_MODEL_REASON };
+	const models = judge.models();
+	const chosen = pickModel(models, model);
+	if (!chosen) return { available: false, reason: NO_MODEL_REASON };
 	await initDb();
 	const { cutoff } = getTimeRangeConfig(range);
 	const { messages, chars } = getPendingFrustrationTotals(cutoff);
 	const inputTokens = messages * REQUEST_OVERHEAD_TOKENS + Math.ceil(chars / CHARS_PER_TOKEN);
-	const rates = getEffectiveTokenCost(model.cost);
-	const cost = (inputTokens * rates.input) / 1e6 + (messages * OUTPUT_TOKENS_PER_REQUEST * rates.output) / 1e6;
-	return { available: true, messages, chars, inputTokens, cost, judge: `${model.provider}/${model.id}` };
+	// A model without a public price (subscription, local) has no dollar estimate, not a free one.
+	const cost =
+		chosen.inputPrice === undefined || chosen.outputPrice === undefined
+			? null
+			: (inputTokens * chosen.inputPrice) / 1e6 + (messages * OUTPUT_TOKENS_PER_REQUEST * chosen.outputPrice) / 1e6;
+	return {
+		available: true,
+		messages,
+		chars,
+		inputTokens,
+		cost,
+		judge: chosen.id,
+		models: models.map(candidate => candidate.id),
+	};
 }
 
 /** Outcome of {@link startFrustrationRun}: the new job, or the HTTP status and reason it was refused. */
@@ -233,8 +229,12 @@ export type StartFrustrationRunResult =
 /**
  * Start the process-wide judge run over the unique unjudged prose in range.
  * Returns immediately after queueing; progress is read via {@link getFrustrationJobStatus}.
+ * This is the only place the judge is ever invoked.
  */
-export async function startFrustrationRun(range?: string | null): Promise<StartFrustrationRunResult> {
+export async function startFrustrationRun(
+	range?: string | null,
+	model?: string | null,
+): Promise<StartFrustrationRunResult> {
 	if (starting || currentJob.state === "running") {
 		return { started: false, status: 409, error: "A frustration judge run is already in progress." };
 	}
@@ -248,8 +248,8 @@ export async function startFrustrationRun(range?: string | null): Promise<StartF
 		} catch (error) {
 			return { started: false, status: 503, error: `The judge could not be loaded: ${errorMessage(error)}` };
 		}
-		const model = judge.primaryModel();
-		if (!model) return { started: false, status: 503, error: NO_MODEL_REASON };
+		const chosen = pickModel(judge.models(), model);
+		if (!chosen) return { started: false, status: 503, error: NO_MODEL_REASON };
 		await initDb();
 		const { cutoff } = getTimeRangeConfig(range);
 		const pending = shuffle(getPendingFrustrationProse(cutoff));
@@ -260,7 +260,7 @@ export async function startFrustrationRun(range?: string | null): Promise<StartF
 			done: 0,
 			failed: 0,
 			cost: 0,
-			judge: `${model.provider}/${model.id}`,
+			judge: chosen.id,
 			error: null,
 			startedAt: now,
 			finishedAt: pending.length > 0 ? null : now,
@@ -270,7 +270,7 @@ export async function startFrustrationRun(range?: string | null): Promise<StartF
 		if (pending.length === 0) return { started: true, job: { ...job }, finished: Promise.resolve() };
 		const controller = new AbortController();
 		currentController = controller;
-		const finished = runJob(job, judge, pending, controller);
+		const finished = runJob(job, judge, chosen.id, pending, controller);
 		return { started: true, job: { ...job }, finished };
 	} finally {
 		starting = false;
@@ -329,6 +329,7 @@ class AdaptiveLimit {
 async function runJob(
 	job: FrustrationJobStatus,
 	judge: StatsJudge,
+	model: string,
 	queue: readonly PendingProse[],
 	controller: AbortController,
 ): Promise<void> {
@@ -336,7 +337,6 @@ async function runJob(
 	const limit = new AdaptiveLimit();
 	let next = 0;
 	let inFlight = 0;
-	let labelFromResult = false;
 	let lastError: string | null = null;
 	let tripped = false;
 
@@ -362,14 +362,16 @@ async function runJob(
 		buffered.push(verdict);
 		if (buffered.length >= VERDICT_BATCH) {
 			flush();
-		} else {
-			flushTimer ??= setTimeout(() => {
+		} else if (!flushTimer) {
+			flushTimer = setTimeout(() => {
 				try {
 					flush();
 				} catch (error) {
 					crash(error);
 				}
 			}, VERDICT_FLUSH_MS);
+			// A pending flush must not hold the host process open.
+			flushTimer.unref();
 		}
 	};
 
@@ -377,28 +379,23 @@ async function runJob(
 		for (let attempt = 1; attempt <= ATTEMPTS_PER_TEXT; attempt++) {
 			if (signal.aborted) return;
 			// Failures are mostly rate limits: give the judge a moment before retrying.
-			if (attempt > 1) await Bun.sleep(RETRY_DELAY_MS * (attempt - 1));
+			if (attempt > 1) await sleep(RETRY_DELAY_MS * (attempt - 1));
 			if (signal.aborted) return;
 			try {
-				const result = await judge.judge({ state: item.prose, questions: FRUSTRATION_QUESTIONS }, { signal });
+				const answer = await judgeFrustration(prompt => judge.complete(model, prompt, signal), item.prose);
 				limit.succeeded();
-				const levels = result.answers.annoyed.probabilities;
-				const pAngry = levels["3"] ?? 0;
-				const label = `${result.provider}/${result.model}`;
+				// A prompted judge answers with one level, so the probabilities are one-hot.
+				const pAngry = answer.annoyed === 3 ? 1 : 0;
 				record({
 					proseHash: item.hash,
-					pAnnoyed: (levels["2"] ?? 0) + pAngry,
+					pAnnoyed: answer.annoyed >= 2 ? 1 : 0,
 					pAngry,
-					target: result.answers.target.choice,
-					judge: label,
+					target: answer.target,
+					judge: model,
 					judgedAt: Date.now(),
 				});
 				job.done++;
-				job.cost += result.usage.cost.total;
-				if (!labelFromResult) {
-					labelFromResult = true;
-					job.judge = label;
-				}
+				job.cost += answer.cost;
 				return;
 			} catch (error) {
 				if (signal.aborted) return;
