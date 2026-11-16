@@ -1,5 +1,12 @@
-import { afterEach, describe, expect, it, vi } from "bun:test";
-import { formatCompact, formatCost, formatErrorRate, formatInteger } from "../src/client/data/formatters";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+	formatCompact,
+	formatCost,
+	formatDurationMs,
+	formatErrorRate,
+	formatInteger,
+	formatTokensPerSecond,
+} from "../src/client/data/formatters";
 
 // Simulate a browser whose default locale is tr-TR, where compact "B" means
 // "bin" (thousand) and "," is the decimal separator. Formatters that fall back
@@ -34,5 +41,16 @@ describe("error-rate formatting", () => {
 		expect(formatErrorRate(1 / 10_000_000)).toBe("<0.01%");
 		expect(formatErrorRate(1 / 100)).toBe("1.0%");
 		expect(formatErrorRate(0)).toBe("0.0%");
+	});
+});
+
+describe("timing formatting", () => {
+	it("renders a null timing as N/A instead of a zero", () => {
+		expect(formatDurationMs(null)).toBe("N/A");
+		expect(formatTokensPerSecond(null)).toBe("N/A");
+		// A measured zero is still a measurement.
+		expect(formatDurationMs(0)).toBe("0.00s");
+		expect(formatDurationMs(1500)).toBe("1.5s");
+		expect(formatTokensPerSecond(42)).toBe("42.0");
 	});
 });

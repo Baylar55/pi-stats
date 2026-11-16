@@ -2,6 +2,7 @@ import { X } from "lucide-react";
 import type React from "react";
 import { useEffect, useRef } from "react";
 import { createPortal } from "react-dom";
+import { isTypingTarget } from "../app/keys";
 import "./modal.css";
 
 export interface ModalAction {
@@ -24,9 +25,11 @@ export interface ModalProps {
 /**
  * Centered dialog over a dimmed overlay, portalled to `document.body` so route
  * containers cannot clip it. Focus lands on the primary action (or the cancel
- * button when there is none) and returns to the opener on close.
+ * button when there is none) unless a field inside the dialog is being used,
+ * and returns to the opener on close.
  */
 export function Modal({ open, title, onClose, primaryAction, cancelLabel = "Cancel", children }: ModalProps) {
+	const dialogRef = useRef<HTMLDivElement>(null);
 	const primaryRef = useRef<HTMLButtonElement>(null);
 	const cancelRef = useRef<HTMLButtonElement>(null);
 	const onCloseRef = useRef(onClose);
@@ -52,6 +55,9 @@ export function Modal({ open, title, onClose, primaryAction, cancelLabel = "Canc
 	const primaryDisabled = primaryAction?.disabled ?? false;
 	useEffect(() => {
 		if (!open) return;
+		// A field the user is operating (the judge model picker) keeps focus while the action toggles.
+		const focused = document.activeElement;
+		if (dialogRef.current?.contains(focused) && isTypingTarget(focused)) return;
 		const target = hasPrimary && !primaryDisabled ? primaryRef.current : cancelRef.current;
 		target?.focus();
 	}, [open, hasPrimary, primaryDisabled]);
@@ -64,7 +70,7 @@ export function Modal({ open, title, onClose, primaryAction, cancelLabel = "Canc
 
 	return createPortal(
 		<div className="modal-overlay" onClick={handleOverlayClick} role="presentation">
-			<div className="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+			<div ref={dialogRef} className="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
 				<div className="modal-header">
 					<h2 id="modal-title" className="modal-title">
 						{title}

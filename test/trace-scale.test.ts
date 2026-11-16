@@ -3,9 +3,9 @@
  * bridge math, equal-width turn/call modes, and ruler tick placement.
  */
 
-import { describe, expect, it } from "bun:test";
-import { buildScale, buildTicks } from "@oh-my-pi/omp-stats/client/traces/time-scale";
-import type { TraceSpan, TraceTrack } from "@oh-my-pi/omp-stats/types";
+import { describe, expect, it } from "vitest";
+import { buildScale, buildTicks } from "../src/client/traces/time-scale";
+import type { TraceSpan, TraceTrack } from "../src/client/types";
 
 const B = 1_700_000_000_000;
 

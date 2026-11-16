@@ -1,30 +1,13 @@
-import { afterEach, describe, expect, it, vi } from "bun:test";
-import { parseHTML } from "@oh-my-pi/pi-utils/dom";
+// @vitest-environment happy-dom
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { ErrorsRoute } from "../src/client/routes/ErrorsRoute";
 
 type FetchInput = string | URL | Request;
-type FetchInit = RequestInit | BunFetchRequestInit;
 
-const originalGlobals = new Map<string, PropertyDescriptor | undefined>();
 let root: Root | null = null;
-
-function installGlobal(name: string, value: unknown): void {
-	originalGlobals.set(name, Object.getOwnPropertyDescriptor(globalThis, name));
-	Object.defineProperty(globalThis, name, { configurable: true, value, writable: true });
-}
-
-function restoreGlobals(): void {
-	for (const [name, descriptor] of originalGlobals) {
-		if (descriptor) {
-			Object.defineProperty(globalThis, name, descriptor);
-		} else {
-			Reflect.deleteProperty(globalThis, name);
-		}
-	}
-	originalGlobals.clear();
-}
+let container: HTMLElement | null = null;
 
 afterEach(async () => {
 	const activeRoot = root;
@@ -34,36 +17,23 @@ afterEach(async () => {
 		});
 		root = null;
 	}
-	vi.restoreAllMocks();
-	restoreGlobals();
+	container?.remove();
+	container = null;
+	vi.unstubAllGlobals();
 });
 
 describe("ErrorsRoute range", () => {
 	it("requests the selected range again when the range changes", async () => {
-		const domWindow = parseHTML('<html><body><div id="root"></div></body></html>').window;
-		installGlobal("window", domWindow);
-		installGlobal("document", domWindow.document);
-		installGlobal("navigator", domWindow.navigator);
-		installGlobal("Node", domWindow.Node);
-		installGlobal("Element", domWindow.Element);
-		installGlobal("HTMLElement", domWindow.HTMLElement);
-		installGlobal("HTMLIFrameElement", domWindow.HTMLIFrameElement);
-		installGlobal("SVGElement", domWindow.SVGElement);
-		installGlobal("IS_REACT_ACT_ENVIRONMENT", true);
-
+		vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
 		const requestedUrls: string[] = [];
-		const fetchStub = Object.assign(
-			async (input: FetchInput, _init?: FetchInit) => {
-				requestedUrls.push(input instanceof Request ? input.url : input.toString());
-				return Response.json([]);
-			},
-			{ preconnect: globalThis.fetch.preconnect },
-		);
-		vi.spyOn(globalThis, "fetch").mockImplementation(fetchStub);
+		vi.stubGlobal("fetch", async (input: FetchInput) => {
+			requestedUrls.push(input instanceof Request ? input.url : input.toString());
+			return Response.json([]);
+		});
 
-		const container = domWindow.document.getElementById("root");
-		if (!container) throw new Error("Expected test root");
-		root = createRoot(container as unknown as Element);
+		container = document.createElement("div");
+		document.body.appendChild(container);
+		root = createRoot(container);
 
 		await act(async () => {
 			root?.render(<ErrorsRoute active range="24h" onRequestClick={() => {}} />);

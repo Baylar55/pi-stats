@@ -1,7 +1,7 @@
-import { afterEach, describe, expect, it, vi } from "bun:test";
-import { parseHTML } from "@oh-my-pi/pi-utils/dom";
+// @vitest-environment happy-dom
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { getSessionTrace } from "../src/client/api";
 import { LiveProvider } from "../src/client/data/live";
 import { type QueryResult, useQuery } from "../src/client/data/query";
@@ -9,29 +9,15 @@ import { inflightRequest, loadQuery, releaseQuery } from "../src/client/data/que
 import type { SessionTrace } from "../src/client/types";
 
 type FetchInput = string | URL | Request;
-type FetchInit = RequestInit | BunFetchRequestInit;
 
-const originalGlobals = new Map<string, PropertyDescriptor | undefined>();
 let root: Root | null = null;
+let container: HTMLElement | null = null;
 let keySeq = 0;
 
-function installGlobal(name: string, value: unknown): void {
-	originalGlobals.set(name, Object.getOwnPropertyDescriptor(globalThis, name));
-	Object.defineProperty(globalThis, name, { configurable: true, value, writable: true });
-}
-
 function mount(): Root {
-	const domWindow = parseHTML('<html><body><div id="root"></div></body></html>').window;
-	installGlobal("window", domWindow);
-	installGlobal("document", domWindow.document);
-	installGlobal("navigator", domWindow.navigator);
-	installGlobal("Node", domWindow.Node);
-	installGlobal("Element", domWindow.Element);
-	installGlobal("HTMLElement", domWindow.HTMLElement);
-	installGlobal("IS_REACT_ACT_ENVIRONMENT", true);
-	const container = domWindow.document.getElementById("root");
-	if (!container) throw new Error("Expected test root");
-	root = createRoot(container as unknown as Element);
+	container = document.createElement("div");
+	document.body.appendChild(container);
+	root = createRoot(container);
 	return root;
 }
 
@@ -41,6 +27,10 @@ function freshKey(): string {
 	return `query-test-${keySeq}`;
 }
 
+beforeEach(() => {
+	vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+});
+
 afterEach(async () => {
 	const activeRoot = root;
 	if (activeRoot) {
@@ -49,12 +39,10 @@ afterEach(async () => {
 		});
 		root = null;
 	}
+	container?.remove();
+	container = null;
 	vi.restoreAllMocks();
-	for (const [name, descriptor] of originalGlobals) {
-		if (descriptor) Object.defineProperty(globalThis, name, descriptor);
-		else Reflect.deleteProperty(globalThis, name);
-	}
-	originalGlobals.clear();
+	vi.unstubAllGlobals();
 });
 
 describe("query store shared requests", () => {
@@ -165,12 +153,11 @@ describe("live query revalidation", () => {
 			}
 			close() {}
 		}
-		installGlobal("EventSource", SyntheticEventSource);
+		vi.stubGlobal("EventSource", SyntheticEventSource);
 		const pending = Promise.withResolvers<number>();
 		let requests = 0;
-		let now = 10_000;
-		vi.useFakeTimers();
-		vi.spyOn(Date, "now").mockImplementation(() => now);
+		// Only the clock and the throttle timer are faked: React's `act` drains through the real setImmediate.
+		vi.useFakeTimers({ now: 10_000, toFake: ["setTimeout", "clearTimeout", "Date"] });
 		const key = freshKey();
 		function Overview() {
 			const result = useQuery([key], () => {
@@ -202,12 +189,10 @@ describe("live query revalidation", () => {
 			}
 			await act(async () => pending.resolve(0));
 			expect(document.querySelector("output")?.textContent).toBe("0");
-			now += 1499;
 			await act(async () => {
 				vi.advanceTimersByTime(1499);
 			});
 			expect(requests).toBe(1);
-			now += 1;
 			await act(async () => {
 				vi.advanceTimersByTime(1);
 			});
@@ -224,16 +209,12 @@ describe("trace revalidation", () => {
 		const trace = { file: "/s.jsonl", tracks: [] };
 		const ifNoneMatch: (string | null)[] = [];
 		const jsonSpy = vi.spyOn(Response.prototype, "json");
-		const fetchStub = Object.assign(
-			async (_input: FetchInput, init?: FetchInit) => {
-				const tag = new Headers(init?.headers).get("If-None-Match");
-				ifNoneMatch.push(tag);
-				if (tag === '"v1"') return new Response(null, { status: 304 });
-				return Response.json(trace, { headers: { ETag: '"v1"' } });
-			},
-			{ preconnect: globalThis.fetch.preconnect },
-		);
-		vi.spyOn(globalThis, "fetch").mockImplementation(fetchStub);
+		vi.stubGlobal("fetch", async (_input: FetchInput, init?: RequestInit) => {
+			const tag = new Headers(init?.headers).get("If-None-Match");
+			ifNoneMatch.push(tag);
+			if (tag === '"v1"') return new Response(null, { status: 304 });
+			return Response.json(trace, { headers: { ETag: '"v1"' } });
+		});
 
 		const results: QueryResult<SessionTrace>[] = [];
 		function TraceProbe({ file }: { file: string }) {

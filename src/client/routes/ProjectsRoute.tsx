@@ -305,6 +305,7 @@ function folderColumns(maxRequests: number, maxCost: number): Column<FolderRowVi
 		{
 			key: "duration",
 			header: "Avg duration",
+			title: "Average request duration (N/A: timing captured since install)",
 			align: "right",
 			sort: row => row.avgDuration ?? -1,
 			render: row => <span className="num">{formatDurationMs(row.avgDuration)}</span>,
