@@ -41,6 +41,7 @@
 	"scripts": {
 		"build": "node scripts/build.mjs",
 		"typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.client.json --noEmit",
+		"pretest": "node scripts/build.mjs",
 		"test": "vitest --run",
 		"prepublishOnly": "npm run typecheck && npm run build && npm test"
 	},
