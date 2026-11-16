@@ -13,7 +13,7 @@ change is listed) · **omitted** (no pi data source; the reason is listed).
 |---|------|----------|
 | F1 | Extensions are loaded with jiti `moduleCache: false` and re-evaluated on `/new`, `/resume`, `/fork`, `/reload`. Module-level state does not survive a session switch. | `dist/core/extensions/loader.js:486-490` |
 | F2 | `session_shutdown.reason` is `"quit" \| "reload" \| "new" \| "resume" \| "fork"`. Only `quit` means the process exits. | `dist/core/extensions/types.d.ts:657` |
-| F3 | Assistant messages carry `durationMs` (monotonic, request start → response end) since pi-ai's `AssistantMessageEventStream` sets it; legacy messages lack it. 237 of 1535 real assistant messages have it. **No TTFT field exists.** | `pi-ai/dist/types.d.ts:407-412`, real data |
+| F3 | Assistant messages carry `durationMs` (monotonic, request start → response end) since pi-ai's `AssistantMessageEventStream` sets it; older messages lack it (237 of 1535 real messages have it). Older messages still record both ends: `message.timestamp` is the request start and the entry's `timestamp` is when pi persisted the finished message; on the 237 messages that have both, that difference equals `durationMs` within 5 ms. **No TTFT field exists.** | `pi-ai/dist/types.d.ts:407-412`, real data |
 | F4 | `turn_end` carries `messageEntryId` (the persisted assistant entry id); `message_end` fires before persistence. | `dist/core/extensions/types.d.ts:848-855`, `agent-session.js:814-826` |
 | F5 | Session totals in pi = assistant `usage` + `usage` entries + `compaction.usage` + `branch_summary.usage` + `toolResult.usage`. | `agent-session.js:3552-3585` (`getSessionStats`) |
 | F6 | `/fork` (`SessionManager.forkFrom`) copies every non-header entry verbatim; `/clone`-style `createBranchedSession` copies the root→leaf path with the same `id`/`timestamp` (only `parentId` is re-chained, labels re-created). Both write `parentSession` in the header. | `session-manager.js` `forkFrom`, `createBranchedSession` |
@@ -31,6 +31,7 @@ change is listed) · **omitted** (no pi data source; the reason is listed).
 | `/stats [--port\|-p n] [--port=n] [--host h] [--host=h]`, defaults `127.0.0.1:3847`, exact usage/error strings | `slash-commands/helpers/stats-dashboard.ts` `parseStatsDashboardArgs` | `pi.registerCommand("stats")` | ported (strings verbatim) |
 | Flag completion | omp command registry | `getArgumentCompletions` | adapted: pi's completion callback |
 | Start-or-reuse in process; `Dashboard already running at: <url> (requested <h>:<p> ignored)` | `launchStatsDashboard` | runtime singleton on `globalThis` (F1) | adapted: state lives on `globalThis`, not module scope |
+| Port conflict: reuse a live dashboard, upgrade an older one by stopping its process, else an ephemeral port | `port-conflict.ts` | same probe and decision table, minus the upgrade | adapted: a current pi-stats dashboard on the port is reused; any other holder is left alone and a free port is used. A dashboard is never stopped: it lives inside the pi process that launched it, so killing the holder would end someone's agent session |
 | Report `Dashboard available at: <url> (sessions sync in the background)` | `launchStatsDashboard` | `ctx.ui.notify`; stdout when `!ctx.hasUI` | ported |
 | Open the page | `openTernPage` → `openPath` | `cmd /c start "" <url>` / `open` / `xdg-open`; URL only over SSH or headless | adapted: no Tern in pi |
 | Close button / `setStatsCloseHandler` | `server.ts`, `client/app/CloseButton.tsx` | API and button ported; no pi launcher can close a system-browser tab, so the handler is never set and the button stays hidden (omp's `setStatsCloseHandler(undefined)` path) | ported, inactive |
@@ -54,7 +55,7 @@ change is listed) · **omitted** (no pi data source; the reason is listed).
 | Session discovery `<agent>/sessions/**.jsonl` | `parser.ts` `listAllSessionFiles` | default sessions dir + `PI_CODING_AGENT_SESSION_DIR` + settings `sessionDir` + the live session's dir (covers `--session-dir`); roots are remembered in `meta` | adapted (F7) |
 | Folder from directory name | `extractFolderFromPath` | header `cwd`, falling back to the decoded directory name | adapted (F8) |
 | Assistant message → `messages` row | `extractStats` | `message.role === "assistant"` with `api/provider/model/usage` | ported |
-| `duration`, `ttft` from the message | `msg.duration`, `msg.ttft` | `duration` = `message.durationMs` ?? live timing; `ttft` = live timing only | adapted (F3) |
+| `duration`, `ttft` from the message | `msg.duration`, `msg.ttft` | `duration` = `message.durationMs` ?? (entry timestamp − `message.timestamp`) ?? live timing; `ttft` = live timing only | adapted (F3) |
 | `model_usage` entries (side-model usage) | `extractModelUsageStats` | `usage` entries (`kind`, `provider`, `model`, `usage`); also `compaction.usage`, `branch_summary.usage`, `toolResult.usage`, attributed to the session's current model | adapted (F5) |
 | Service-tier tracking, premium-request derivation | `parser.ts`, `pi-ai` | none | omitted (F12); columns kept, always `0` / `NULL` |
 | Tool calls + result linkage (`args_chars`, `result_chars`, `is_error`, `calls_in_turn`) | `extractToolCalls`, `extractToolResultLink` | `toolCall` content blocks, `toolResult` messages | ported |
@@ -71,7 +72,8 @@ change is listed) · **omitted** (no pi data source; the reason is listed).
 |---|---|---|
 | `bun:sqlite` | `db.ts` | adapted: one adapter (`src/sqlite.ts`) over `node:sqlite` `DatabaseSync`; `bun:sqlite` when `process.versions.bun` |
 | DB path `~/.omp/stats.db` | `pi-utils` `getStatsDbPath` | adapted: `<getAgentDir()>/stats.db` |
-| `messages`, `tool_calls`, `user_messages`, `frustration_verdicts`, `session_titles`, `file_offsets`, `meta` | `db.ts` | ported (same columns) |
+| `messages`, `tool_calls`, `user_messages`, `frustration_verdicts`, `file_offsets`, `meta` | `db.ts` | ported (same columns); `messages` gains `cost_estimated` and `cache_write_1h_tokens` so a changed rate card can re-price estimates |
+| `session_titles` | — | not in omp@7c49c11 (its titles come from a `title` entry in the transcript). pi has no title entry: the Traces list shows the `/name` or the first prompt, kept in the sync cursor |
 | `message_rollup`, `tool_rollup`, `tool_agent_rollup`, `session_rollup` + dirty tables and triggers | `db.ts`, `rollup.ts` | ported |
 | Newest-first re-roll of dirty hours in short immediate transactions; exact reads over dirty hours | `rollup.ts` | ported |
 | Versioned migrations through `meta` keys | `db.ts` | ported; omp-only backfills of pre-existing omp databases are dropped (a pi-stats DB starts empty) |
@@ -88,7 +90,7 @@ change is listed) · **omitted** (no pi data source; the reason is listed).
 | Cache savings | `(uncached prompt cost − actual prompt cost) / uncached prompt cost * 100` | ported |
 | Error rate | `count(stopReason = error) / total_calls * 100` | ported |
 | API-equivalent cost | recorded `usage.cost`; zero-cost subscription/OAuth usage is priced at the public rate of the same model; no public price → unpriced, N/A, excluded from dollar totals | adapted: rate card from pi's model registry instead of `pi-catalog` |
-| Avg latency | mean `duration`, timed rows only | ported |
+| Avg latency | mean `duration`, timed rows only | ported; available for history too (F3) |
 | TTFT | mean `ttft`, timed rows only | adapted: live capture only (F3) |
 | Premium requests | `usage.premiumRequests` | omitted (F12); API field stays `0`, UI stat removed |
 | Time ranges `1h/24h/7d/30d/90d/All`, buckets 5 min / 1 h / local-midnight days, `All` capped at 1500 buckets, empty buckets zero | `aggregator.ts` `getTimeRangeConfig`, `client/data/range.ts`, `rollup.ts` | ported |
@@ -103,9 +105,9 @@ change is listed) · **omitted** (no pi data source; the reason is listed).
 | Costs (`c`) | `routes/CostsRoute.tsx` | ported |
 | Requests (`r`) + request drawer | `routes/RequestsRoute.tsx`, `ui/RequestDrawer.tsx` | ported |
 | Errors (`e`) | `routes/ErrorsRoute.tsx` | ported |
-| Traces (`t`): timeline canvas, minimap, span drawer, transcript list, aggregates | `routes/TracesRoute.tsx`, `traces/*`, `trace.ts` | adapted: spans are built from pi entries (assistant `durationMs`/live timing, `toolResult.durationMs`); omp-only journal entries (`session_init`, `mode_change`, background jobs, subagent lanes, advisors) have no pi source |
+| Traces (`t`): timeline canvas, minimap, span drawer, transcript list, aggregates | `routes/TracesRoute.tsx`, `traces/*`, `trace.ts` | adapted: spans are built from pi entries (model spans from the request duration, tool spans from `toolResult` timestamps and `durationMs`, TTFT from live timings); nested child transcripts become tracks when they exist. omp-only journal entries (`session_init`, `mode_change`, `tool_execution_start`, `session_exit`, background jobs, advisors) have no pi source |
 | Tools (`l`) | `routes/ToolsRoute.tsx` | ported |
-| Frustration (`f`) | `routes/FrustrationRoute.tsx`, `frustration.ts`, `user-metrics.ts` | ported; judge runs through `ctx.modelRegistry.complete()` |
+| Frustration (`f`) | `routes/FrustrationRoute.tsx`, `frustration.ts`, `user-metrics.ts` | adapted: judge runs through `ctx.modelRegistry.complete()`; rows are per provider/model (the provider is the page's class filter) because pi has no catalog identity to merge spelling variants by |
 | Projects (`j`) | `routes/ProjectsRoute.tsx`, `normalizeProjectPath` | ported |
 | Gain (`g`) | `routes/GainRoute.tsx`, `gain-aggregator.ts` | omitted: reads omp's `snapcompact-savings.jsonl`; pi has no snapcompact |
 | Spotlight (`s`) | `routes/SpotlightRoute.tsx`, `spotlight-*.ts` | omitted: reads omp's read-tool spotlight journal; pi's `read` tool records none |
@@ -116,7 +118,7 @@ change is listed) · **omitted** (no pi data source; the reason is listed).
 | Charts (Chart, TimeChart, BarList, ShareBar, Sparkline, DotWhisker, Waterfall, Legend), model colors | `charts/*`, `data/colors.ts` | ported |
 | Visual design | `styles.css`, `routes/*.css`, `traces/traces.css`, `ui/*.css` | ported |
 | Agent-type breakdown panels | `OverviewRoute`, `ToolsRoute` | adapted: rendered only when a non-`main` type has data (F10) |
-| Untimed rows | — | adapted: N/A, never 0; pages say "timing captured since install" |
+| Untimed rows | — | adapted: N/A, never 0, excluded from averages; pages say "timing captured since install" |
 
 ## HTTP API
 
@@ -139,20 +141,18 @@ change is listed) · **omitted** (no pi data source; the reason is listed).
 |---|---|
 | Heuristic metrics (yelling, profanity, anguish, negation, repetition, blame), markup stripped | ported (`user-metrics.ts` verbatim) |
 | Judge rubric `prompts/judge/frustration.json` | ported verbatim |
-| Judge transport | adapted: omp `judgeQuestions` over its model roles → `ctx.modelRegistry.complete()` with the model chosen in the dashboard, defaulting to the session's current model |
+| Judge transport | adapted: omp `judgeQuestions` over its model roles → a host-free port of omp's prompted text judge (`judge.ts`) sent through `ctx.modelRegistry.complete()` with the model chosen in the dashboard. Default: `judgeModel` in `<agentDir>/pi-stats.json`, else the session's current model. No `temperature` is sent (pi forwards it verbatim and reasoning models reject it). A prompted judge answers one level, so stored probabilities are 0 or 1 |
 | Run only on click; estimate first; cancel; verdict cache by `prose_hash` | ported |
 | Standalone bin has no judge; UI says so | ported |
 
-## Tests (omp `packages/stats/test`, run with vitest on Node)
+## Tests (omp `packages/stats/test`, on vitest)
 
 | omp test | Status |
 |---|---|
-| `parser-malformed-entries`, `parser-large-session`, `parser-model-usage`, `incremental-tail`, `sync-serial`, `reply-links`, `agent-type` | ported |
-| `fork-dedup` | ported |
-| `rollup`, `db-cost`, `db-range`, `errors-range`, `provider-stats`, `tool-stats`, `local-day-buckets` | ported |
-| `user-metrics`, `frustration` | ported |
-| `server-port-conflict`, `live-external-writes`, `stats-cli`, `server-embedded-client` (→ static client) | ported |
-| `trace-builder`, `trace-etag`, `trace-lane-axes`, `trace-scale` | ported where the spans exist in pi |
-| `client-number-format`, `client-query`, `client-view-models`, `model-color-consistency`, `errors-route-range` | ported |
-| `gain-aggregator` | project-path normalization cases ported; snapcompact cases omitted |
+| `parser-malformed-entries`, `parser-large-session`, `parser-model-usage`, `incremental-tail`, `sync-serial`, `reply-links`, `agent-type`, `fork-dedup`, `tool-stats`, `provider-stats`, `user-metrics` | ported to pi-format fixtures |
+| `rollup`, `db-cost`, `db-range`, `local-day-buckets` | ported (`db-cost` rewritten for the rate-card rules) |
+| `frustration`, `trace-builder` | ported |
+| `server-port-conflict`, `live-external-writes`, `stats-cli`, `trace-etag`, `errors-range`, `server-embedded-client` (→ `server-static-client`) | ported |
+| `client-number-format`, `client-query`, `client-view-models`, `model-color-consistency`, `errors-route-range`, `trace-scale`, `trace-lane-axes` | ported |
+| `gain-aggregator` | project-path normalization cases ported as `projects`; snapcompact cases omitted |
 | `spotlight`, `spotlight-measures`, `embedded-client-archive`, `smoke-worker-darwin`, `behavior-backfill`, `priority-premium-requests` | omitted: test omp-only data, packaging, or legacy-DB migrations |
