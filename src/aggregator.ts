@@ -1,7 +1,9 @@
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
-import { getAgentDbPath, getStatsDbPath, workerHostEntry } from "@oh-my-pi/pi-utils";
-import { withFileLock } from "@oh-my-pi/pi-utils/file-lock";
+import { fileURLToPath } from "node:url";
+import { Worker } from "node:worker_threads";
+import { addSessionRoot, getAgentDir, getSessionRoots, getStatsDbPath } from "./config";
 import {
 	applySessionParseResults,
 	completeSessionSync,
@@ -11,10 +13,11 @@ import {
 	getFileOffsets,
 	getMessageById,
 	getMessageCount,
+	getMetaValue,
 	initDb,
-	markSessionBackfillsComplete,
 	type ParsedSession,
 	prepareSessionSync,
+	setMetaValue,
 } from "./db";
 import {
 	getSessionEntry,
@@ -41,22 +44,16 @@ import {
 	getToolTimeSeries,
 	type RangeWindow,
 } from "./rollup";
-import { spotlightRowCount } from "./spotlight-ingest";
-import type { SyncWorkerRequest, SyncWorkerResponse } from "./sync-worker";
-// Coding-agent binary/bundle workers route through the CLI entrypoint with a
-// hidden argv mode, so the compiled binary and npm bundle only need one
-// JavaScript entry. Standalone source `omp-stats` keeps using this package's
-// own sync-worker source file.
+import type { SyncWorkerData, SyncWorkerRequest, SyncWorkerResponse } from "./sync-worker";
 import type {
 	DashboardStats,
 	FolderStats,
 	MessageStats,
 	ProviderDashboardStats,
-	ProviderWindowStats,
 	RequestDetails,
 	ToolDashboardStats,
 } from "./types";
-import { computeUsageWindowStats, fetchUsageData, type UsageDataSnapshot } from "./usage-windows";
+import { withFileLock } from "./util";
 
 const STATS_SYNC_LOCK_RETRY_MS = 25;
 const STATS_SYNC_LOCK_WAIT_MS = 60 * 60 * 1000;
@@ -65,13 +62,13 @@ const SYNC_BATCH_FILES = 512;
 const SYNC_BATCH_ROWS = 8192;
 const SYNC_METADATA_FILES = 128;
 const SYNC_INLINE_READS = 8;
+/** `meta` key holding every session root a sync has seen (JSON array of paths). */
+const SESSION_ROOTS_KEY = "session_roots";
 
 /**
- * Serialize stats ingestion and archive reconciliation across processes.
- * The lock covers file discovery, parsing, and the final SQLite write so a
- * parse result for a session moved by GC can never commit after cleanup.
- * The native lock is owned by an operating-system primitive, so an interrupted
- * owner is released automatically and a live owner is never displaced.
+ * Serialize stats ingestion across processes. The lock covers file discovery,
+ * parsing, and the final SQLite write. A lock whose owner died (pi killed
+ * mid-sync) is detected by pid and taken over; see `withFileLock`.
  */
 export async function withStatsSyncLock<T>(dbPath: string, fn: () => Promise<T>): Promise<T> {
 	await fs.promises.mkdir(path.dirname(dbPath), { recursive: true });
@@ -113,17 +110,19 @@ export interface SyncOptions {
 	files?: readonly string[];
 }
 
+/**
+ * The built parse worker beside this module, or null when running from
+ * source (tests), where parsing stays on the calling thread.
+ */
+function syncWorkerPath(): string | null {
+	const file = fileURLToPath(new URL("./sync-worker.js", import.meta.url));
+	return fs.existsSync(file) ? file : null;
+}
+
 function defaultWorkerCount(): number {
-	// Bun 1.3.x can abort the macOS process when stats sync workers re-enter
-	// the compiled `omp` binary. Keep macOS on the documented serial path.
-	if (process.platform === "darwin") return 1;
-	// `navigator.hardwareConcurrency` is the portable answer in Bun; fall
-	// back to a small fixed pool if it's somehow unavailable.
-	const hw = typeof navigator !== "undefined" ? (navigator.hardwareConcurrency ?? 0) : 0;
-	const raw = hw > 0 ? hw : 4;
 	// Cap at 8 - parse is JSON-bound, and SQLite writes serialize on main
 	// thread anyway, so more workers stop helping.
-	return Math.min(8, Math.max(2, Math.floor(raw)));
+	return Math.min(8, Math.max(2, os.availableParallelism()));
 }
 
 interface WorkerHandle {
@@ -133,48 +132,28 @@ interface WorkerHandle {
 	reject: ((err: Error) => void) | null;
 }
 
-/**
- * Create a fresh sync worker. When the process was started from a
- * self-dispatching CLI entry (omp in source, npm-bundle, or compiled form),
- * re-enter that entry with a worker argv selector; otherwise (standalone
- * omp-stats, bun test, SDK embedding) load the worker module directly, so this
- * package keeps zero runtime dependency on `@oh-my-pi/pi-coding-agent`.
- */
-function createSyncWorker(): Worker {
-	const hostEntry = workerHostEntry();
-	if (hostEntry) {
-		return new Worker(hostEntry, { type: "module", argv: ["__omp_worker_stats_sync"] });
-	}
-	return new Worker(new URL("./sync-worker.ts", import.meta.url).href, { type: "module" });
-}
-
-function spawnWorker(): WorkerHandle {
-	const worker = createSyncWorker();
+function spawnWorker(workerPath: string): WorkerHandle {
+	// Workers start with a fresh module graph: hand them the directories this thread resolved.
+	const workerData: SyncWorkerData = { agentDir: getAgentDir(), sessionRoots: getSessionRoots() };
+	const worker = new Worker(workerPath, { workerData });
+	// A sync must never hold the host process (pi) open.
+	worker.unref();
 	const handle: WorkerHandle = { worker, busy: false, resolve: null, reject: null };
-	worker.onmessage = (event: MessageEvent<SyncWorkerResponse>) => {
+	const settle = (): Pick<WorkerHandle, "resolve" | "reject"> => {
 		const { resolve, reject } = handle;
 		handle.resolve = null;
 		handle.reject = null;
 		handle.busy = false;
+		return { resolve, reject };
+	};
+	worker.on("message", (data: SyncWorkerResponse) => {
+		const { resolve, reject } = settle();
 		if (!resolve || !reject) return;
-		const data = event.data;
-		if (!data.ok) {
-			reject(new Error(data.error));
-			return;
-		}
-		if (data.kind === "pong") {
-			reject(new Error("sync worker: unexpected pong on parse channel"));
-			return;
-		}
-		resolve(data.result);
-	};
-	worker.onerror = (event: ErrorEvent) => {
-		const { reject } = handle;
-		handle.resolve = null;
-		handle.reject = null;
-		handle.busy = false;
-		reject?.(event.error instanceof Error ? event.error : new Error(event.message || "worker error"));
-	};
+		if (data.ok) resolve(data.result);
+		else reject(new Error(data.error));
+	});
+	worker.on("error", error => settle().reject?.(error instanceof Error ? error : new Error(String(error))));
+	worker.on("exit", code => settle().reject?.(new Error(`sync worker exited with code ${code}`)));
 	return handle;
 }
 
@@ -191,48 +170,23 @@ function dispatch(handle: WorkerHandle, request: SyncWorkerRequest): Promise<Par
 }
 
 /**
- * Smoke test: spawns one sync worker, pings it, asserts the pong response,
- * then terminates. Used by `omp --smoke-test` so the install-method CI jobs
- * catch the silent worker-load failure that hit compiled binaries in #1011
- * and #1027 — neither `--version` nor `stats --summary` exercises the worker
- * spawn path on a fresh install (no session files = early return), so a
- * dedicated probe is the only reliable signal.
- *
- * No-op on darwin: `syncAllSessions` keeps macOS on the serial parser path
- * (see {@link defaultWorkerCount}) so the worker spawn surface is unreachable
- * from the CLI, and probing it under the hardened runtime in
- * `scripts/ci-macos-sign.sh` would re-enter the Bun-worker abort surface that
- * motivated the darwin serial default in the first place.
- *
- * Rejects on transport error, error response, or timeout.
+ * Remember every session root seen so far. A root only the live session knows
+ * (`--session-dir`, project settings) is handed over by the extension once;
+ * later launches, including the standalone bin, still scan it.
  */
-export async function smokeTestSyncWorker({ timeoutMs = 5_000 }: { timeoutMs?: number } = {}): Promise<void> {
-	if (process.platform === "darwin") return;
-	const worker = createSyncWorker();
-	const { promise, resolve, reject } = Promise.withResolvers<void>();
-	const timer = setTimeout(() => reject(new Error(`sync worker did not pong within ${timeoutMs}ms`)), timeoutMs);
-	worker.onmessage = (event: MessageEvent<SyncWorkerResponse>) => {
-		const data = event.data;
-		if (!data.ok) {
-			reject(new Error(data.error));
-			return;
-		}
-		if (data.kind !== "pong") {
-			reject(new Error(`sync worker: expected pong, got ${JSON.stringify(data)}`));
-			return;
-		}
-		resolve();
-	};
-	worker.onerror = (event: ErrorEvent) => {
-		reject(event.error instanceof Error ? event.error : new Error(event.message || "worker error"));
-	};
+function rememberSessionRoots(): void {
 	try {
-		worker.postMessage({ kind: "ping" } satisfies SyncWorkerRequest);
-		await promise;
-	} finally {
-		clearTimeout(timer);
-		worker.terminate();
+		const stored: unknown = JSON.parse(getMetaValue(SESSION_ROOTS_KEY) ?? "[]");
+		if (Array.isArray(stored)) {
+			for (const root of stored) {
+				if (typeof root === "string" && root) addSessionRoot(root);
+			}
+		}
+	} catch {
+		// A corrupt value is replaced below.
 	}
+	const roots = JSON.stringify(getSessionRoots());
+	if (roots !== getMetaValue(SESSION_ROOTS_KEY)) setMetaValue(SESSION_ROOTS_KEY, roots);
 }
 
 /**
@@ -241,7 +195,7 @@ export async function smokeTestSyncWorker({ timeoutMs = 5_000 }: { timeoutMs?: n
  * `workers: 1` pipelines file reads and parses inline, committing in discovery order.
  * Larger pools fan parsing out across workers
  * (one in-flight job per worker) while DB writes and offset bookkeeping stay on
- * the calling thread. Bounded batches commit rows and cursors atomically without
+ * the calling thread (always inline when the worker file is not built). Bounded batches commit rows and cursors atomically without
  * holding a database transaction open during file I/O.
  * `onProgress` fires once per completed file (skipped files included so the
  * bar walks at a steady rate).
@@ -297,6 +251,7 @@ async function syncAllSessionsLocked(
 	opts?: SyncOptions,
 ): Promise<{ processed: number; files: number; reconcile: boolean }> {
 	await initDb();
+	rememberSessionRoots();
 	const replay = prepareSessionSync();
 
 	const files = opts?.files ?? (await orderForIngest(await listAllSessionFiles()));
@@ -340,11 +295,10 @@ async function syncAllSessionsLocked(
 
 	const finish = () => {
 		flush();
-		// A targeted sync cannot settle reconciliation or backfills (they need
-		// every transcript); leave their markers for the next full sync.
+		// A targeted sync cannot settle reconciliation (it needs every
+		// transcript); leave its marker for the next full sync.
 		if (opts?.files) return { processed: totalProcessed, files: filesProcessed, reconcile: false };
 		completeSessionSync(reconcile);
-		markSessionBackfillsComplete();
 		return { processed: totalProcessed, files: filesProcessed, reconcile };
 	};
 	if (files.length === 0) return finish();
@@ -418,19 +372,19 @@ async function syncAllSessionsLocked(
 			result.userStats.length +
 			result.userLinks.length +
 			result.toolCalls.length +
-			result.toolResults.length +
-			spotlightRowCount(result.spotlight);
+			result.toolResults.length;
 		if (pending.length >= SYNC_BATCH_FILES || pendingRows >= SYNC_BATCH_ROWS) flush();
 	};
 
-	let requestedWorkers = Math.max(1, Math.floor(opts?.workers ?? defaultWorkerCount()));
+	const workerPath = syncWorkerPath();
+	let requestedWorkers = workerPath ? Math.max(1, Math.floor(opts?.workers ?? defaultWorkerCount())) : 1;
 	// A few already-tracked transcripts (the watcher's usual work) need only
 	// kilobyte tail reads: parsing them inline beats starting a worker.
 	if (requestedWorkers > 1 && opts?.workers === undefined && files.length <= SYNC_INLINE_READS) {
 		const offsets = getFileOffsets([...files]);
 		if (files.every(file => offsets.get(file)?.parserState)) requestedWorkers = 1;
 	}
-	if (requestedWorkers === 1) {
+	if (requestedWorkers === 1 || !workerPath) {
 		for (let start = 0; start < files.length; start += SYNC_INLINE_READS) {
 			const results = await Promise.allSettled(
 				Array.from({ length: Math.min(SYNC_INLINE_READS, files.length - start) }, (_, offset) =>
@@ -448,6 +402,8 @@ async function syncAllSessionsLocked(
 	}
 
 	const poolSize = Math.min(files.length, requestedWorkers);
+	// Narrowed by the inline return above; a const keeps that for the closure below.
+	const poolWorkerPath = workerPath;
 
 	const handles: WorkerHandle[] = [];
 
@@ -460,7 +416,7 @@ async function syncAllSessionsLocked(
 				if (idx >= files.length) return;
 				const parsed = await prepareFile(idx, (file, fromOffset, parserState, replay) => {
 					if (!handle) {
-						handle = spawnWorker();
+						handle = spawnWorker(poolWorkerPath);
 						handles.push(handle);
 					}
 					return dispatch(handle, { sessionFile: file, fromOffset, parserState, replay });
@@ -480,7 +436,7 @@ async function syncAllSessionsLocked(
 			if (result.status === "rejected") throw result.reason;
 		}
 	} finally {
-		for (const handle of handles) handle.worker.terminate();
+		for (const handle of handles) void handle.worker.terminate();
 	}
 
 	return finish();
@@ -584,10 +540,9 @@ export async function getRequestDetails(id: number): Promise<RequestDetails | nu
 	if (!msg) return null;
 
 	const entry = await getSessionEntry(msg.sessionFile, msg.entryId);
-	// Role-model attempts (judge, auto-thinking, …) journal only a `model_usage`
-	// record: usage and outcome, no request or response payload.
-	if (entry?.type === "model_usage") return { ...msg, messages: [entry], output: null };
-	if (entry?.type !== "message" || !("message" in entry)) return null;
+	if (!entry) return null;
+	// `usage`, `compaction` and `branch_summary` entries carry usage but no request or response payload.
+	if (entry.type !== "message" || !("message" in entry)) return { ...msg, messages: [entry], output: null };
 
 	return {
 		...msg,
@@ -620,8 +575,7 @@ export async function getToolDashboardStats(range?: string | null): Promise<Tool
 
 /**
  * Get the providers dashboard payload: per-provider totals, peak-burn-hours
- * histogram and provider token time series. Subscription windows are served
- * separately by {@link getProviderWindowStats}.
+ * histogram and provider token time series.
  */
 export async function getProviderDashboardStats(range?: string | null): Promise<ProviderDashboardStats> {
 	await initDb();
@@ -630,53 +584,5 @@ export async function getProviderDashboardStats(range?: string | null): Promise<
 		providers: getStatsByProvider(window.cutoff),
 		hourly: getProviderHourlyBurn(window.cutoff),
 		series: getProviderTimeSeries(window),
-	};
-}
-
-const USAGE_CACHE_TTL_MS = 60_000;
-let usageCache: { key: string; at: number; data: Promise<UsageDataSnapshot> } | null = null;
-
-/**
- * Usage snapshots since `sinceMs`, memoized for a minute per hour-aligned
- * cutoff and source database: the broker fetch takes seconds and the
- * dashboard asks on every range switch and live refresh.
- */
-function cachedUsageData(sinceMs: number): Promise<UsageDataSnapshot> {
-	const sinceHour = Math.floor(sinceMs / HOUR_MS) * HOUR_MS;
-	const key = `${getAgentDbPath()}:${sinceHour}`;
-	const now = Date.now();
-	if (usageCache?.key === key && now - usageCache.at < USAGE_CACHE_TTL_MS) {
-		return usageCache.data;
-	}
-	const data = fetchUsageData(sinceHour);
-	usageCache = { key, at: now, data };
-	data.catch(() => {
-		if (usageCache?.data === data) usageCache = null;
-	});
-	return data;
-}
-
-/**
- * Subscription-window analytics derived from recorded usage-limit snapshots:
- * insights for every provider window, plus utilization series for `provider`
- * only (all series can number in the thousands).
- *
- * Window token estimates use broker-held fleet token burn when a broker is
- * configured — the window fractions cover every install sharing the broker's
- * credentials, so dividing them into local-only tokens would undercount.
- */
-export async function getProviderWindowStats(
-	range?: string | null,
-	provider?: string | null,
-): Promise<ProviderWindowStats> {
-	await initDb();
-	const { cutoff } = getTimeRangeConfig(range);
-	const usage = await cachedUsageData(cutoff ?? 0);
-	const tokensByProvider =
-		usage.fleetTokensByProvider ?? new Map(getStatsByProvider(cutoff).map(p => [p.provider, p.totalTokens]));
-	const { usageSeries, windowInsights } = computeUsageWindowStats(usage.rows, tokensByProvider);
-	return {
-		windowInsights,
-		usageSeries: provider ? usageSeries.filter(series => series.provider === provider) : [],
 	};
 }

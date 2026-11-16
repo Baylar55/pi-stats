@@ -1,99 +1,102 @@
-import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
-import * as path from "node:path";
-import { getRecentRequests, initDb, insertMessageStats } from "@oh-my-pi/omp-stats/db";
-import { parseSessionFile } from "@oh-my-pi/omp-stats/parser";
-import { handleApi } from "@oh-my-pi/omp-stats/server";
-import { getSessionsDir } from "@oh-my-pi/pi-utils";
+import { describe, expect, it } from "vitest";
+import { getRequestDetails } from "../src/aggregator";
+import { getRecentRequests, initDb, insertMessageStats } from "../src/db";
+import { parseSessionFile } from "../src/parser";
+import { assistant, header, sessionPath, T0, toolCall, toolResult, usage, writeSession } from "./helpers/session";
 import { installStatsTestIsolation } from "./helpers/temp-agent";
 
 installStatsTestIsolation("@pi-stats-model-usage-");
 
-describe("model usage session entries", () => {
-	it("parses and aggregates non-transcript model calls", async () => {
-		const dir = path.join(getSessionsDir(), "--tmp--model-usage");
-		await fs.mkdir(dir, { recursive: true });
-		const file = path.join(dir, "session.jsonl");
-		await Bun.write(
-			file,
-			`${JSON.stringify({
-				type: "model_usage",
-				id: "classifier-1",
-				parentId: null,
-				timestamp: "2026-08-31T10:00:00.000Z",
-				purpose: "auto-thinking",
-				role: "smol",
-				api: "anthropic-messages",
-				provider: "anthropic",
-				model: "claude-haiku-4-5",
-				stopReason: "error",
-				errorMessage: "Internal Server Error",
-				usage: {
-					input: 11,
-					output: 2,
-					cacheRead: 3,
-					cacheWrite: 0,
-					totalTokens: 16,
-					cost: { input: 1, output: 2, cacheRead: 3, cacheWrite: 0, total: 6 },
-				},
-			})}\n`,
-		);
+const ISO = new Date(T0).toISOString();
+
+/** A `usage` entry: model-attributed usage that is not an assistant message (pi's cache warming). */
+function usageEntry(id: string): Record<string, unknown> {
+	return {
+		type: "usage",
+		id,
+		parentId: null,
+		timestamp: ISO,
+		kind: "cache_warm",
+		provider: "anthropic",
+		model: "claude-s",
+		usage: usage({ input: 0, output: 0, cacheRead: 50_000, totalTokens: 50_000, cost: { input: 0, output: 0, cacheRead: 0.015, cacheWrite: 0, total: 0.015 } }),
+	};
+}
+
+describe("non-message usage", () => {
+	it("counts a usage entry once as a request of its model", async () => {
+		const file = await writeSession(sessionPath(), [header(), usageEntry("warm-1")]);
 
 		const result = await parseSessionFile(file);
 		await initDb();
 		expect(insertMessageStats(result.stats)).toBe(1);
+		// A re-sync upserts the same row (re-deriving its cost) instead of adding one.
+		insertMessageStats(result.stats);
+		expect(getRecentRequests(5)).toHaveLength(1);
 		expect(getRecentRequests(1)[0]).toMatchObject({
-			entryId: "classifier-1",
-			api: "anthropic-messages",
+			entryId: "warm-1",
 			provider: "anthropic",
-			model: "claude-haiku-4-5",
-			stopReason: "error",
-			errorMessage: "Internal Server Error",
-			usage: { totalTokens: 16, cost: { total: 6 } },
+			model: "claude-s",
+			stopReason: "stop",
+			timestamp: T0,
+			duration: null,
+			ttft: null,
+			usage: { cacheRead: 50_000, totalTokens: 50_000, cost: { total: 0.015 } },
 		});
 	});
 
-	it("opens a model_usage request in the detail endpoint without a payload", async () => {
-		const dir = path.join(getSessionsDir(), "--tmp--model-usage-details");
-		await fs.mkdir(dir, { recursive: true });
-		const file = path.join(dir, "session.jsonl");
-		await Bun.write(
-			file,
-			`${JSON.stringify({
-				type: "model_usage",
-				id: "judge-1",
-				parentId: null,
-				timestamp: "2026-08-31T10:00:00.000Z",
-				purpose: "auto-thinking",
-				role: "typesafe",
-				api: "typesafe",
-				provider: "typesafe",
-				model: "jev-latest",
-				stopReason: "stop",
-				usage: {
-					input: 927,
-					output: 47,
-					cacheRead: 0,
-					cacheWrite: 0,
-					totalTokens: 974,
-					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-				},
-			})}\n`,
-		);
+	it("attributes compaction, branch-summary and tool usage to the model in use", async () => {
+		const file = await writeSession(sessionPath(), [
+			header(),
+			{ type: "model_change", id: "mc", parentId: null, timestamp: ISO, provider: "virtual", modelId: "router" },
+			{ type: "compaction", id: "early", parentId: "mc", timestamp: ISO, summary: "s", firstKeptEntryId: "mc", tokensBefore: 1, usage: usage() },
+			assistant("a1", { message: { provider: "anthropic", model: "claude-s", api: "anthropic-messages", content: [toolCall("call-1", "search")] } }),
+			toolResult("tr1", "call-1", "found", { message: { usage: usage({ totalTokens: 7 }) } }),
+			{ type: "branch_summary", id: "bs", parentId: "a1", timestamp: ISO, fromId: "tr1", summary: "s", usage: usage() },
+			{ type: "compaction", id: "no-usage", parentId: "bs", timestamp: ISO, summary: "s", firstKeptEntryId: "bs", tokensBefore: 1 },
+		]);
+
+		const result = await parseSessionFile(file);
+
+		expect(result.stats.map(s => [s.entryId, s.provider, s.model, s.api])).toEqual([
+			// Before any response the selected model is all there is to name.
+			["early", "virtual", "router", "unknown"],
+			["a1", "anthropic", "claude-s", "anthropic-messages"],
+			["tr1", "anthropic", "claude-s", "anthropic-messages"],
+			["bs", "anthropic", "claude-s", "anthropic-messages"],
+		]);
+	});
+
+	it("maps durationMs to the duration and leaves the time to first token unknown", async () => {
+		const file = await writeSession(sessionPath(), [
+			assistant("timed", { message: { durationMs: 4_200 } }),
+			assistant("legacy", { timestamp: T0 + 1 }),
+		]);
+
+		const result = await parseSessionFile(file);
+
+		expect(result.stats.map(s => [s.entryId, s.duration, s.ttft])).toEqual([
+			["timed", 4_200, null],
+			["legacy", null, null],
+		]);
+	});
+
+	it("opens a usage entry in the request details without a payload", async () => {
+		const file = await writeSession(sessionPath(), [header(), usageEntry("warm-1")]);
 		await initDb();
 		insertMessageStats((await parseSessionFile(file)).stats);
 		const [row] = getRecentRequests(1);
+		if (row.id === undefined) throw new Error("stored request has no id");
 
-		const response = await handleApi(new Request(`http://stats.test/api/request/${row.id}`));
-		expect(response.status).toBe(200);
-		expect(await response.json()).toMatchObject({
+		expect(await getRequestDetails(row.id)).toMatchObject({
 			id: row.id,
-			model: "jev-latest",
+			model: "claude-s",
 			output: null,
-			messages: [{ type: "model_usage", id: "judge-1", purpose: "auto-thinking" }],
+			messages: [{ type: "usage", id: "warm-1", kind: "cache_warm" }],
 		});
 
-		await Bun.write(file, "");
-		expect((await handleApi(new Request(`http://stats.test/api/request/${row.id}`))).status).toBe(404);
+		await fs.writeFile(file, "");
+		expect(await getRequestDetails(row.id)).toBeNull();
 	});
 });

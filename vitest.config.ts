@@ -1,7 +1,7 @@
 import { defineConfig } from "vitest/config";
 
 export default defineConfig({
-	esbuild: { jsx: "automatic" },
+	oxc: { jsx: { runtime: "automatic" } },
 	test: {
 		include: ["test/**/*.test.{ts,tsx}"],
 		// Tests redirect the process-wide agent dir and hold one SQLite handle: one process per file.

@@ -1,135 +1,85 @@
-import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { syncAllSessions } from "@oh-my-pi/omp-stats/aggregator";
-import { getOverallStats } from "@oh-my-pi/omp-stats/rollup";
-import { getSessionsDir } from "@oh-my-pi/pi-utils";
+import { describe, expect, it } from "vitest";
+import { syncAllSessions } from "../src/aggregator";
+import { addSessionRoot, getSessionRoots } from "../src/config";
+import { closeDb, getRecentRequests } from "../src/db";
+import { setModelPrices } from "../src/pricing";
+import { initDb } from "../src/db";
+import { getOverallStats, getStatsByFolder } from "../src/rollup";
+import { assistant, header, sessionPath, usage, writeSession } from "./helpers/session";
 import { installStatsTestIsolation } from "./helpers/temp-agent";
 
-installStatsTestIsolation("@pi-stats-sync-serial-");
+const isolation = installStatsTestIsolation("@pi-stats-sync-serial-");
 
-afterEach(() => {
-	vi.restoreAllMocks();
-});
+describe("stats sync", () => {
+	it("ingests a transcript and skips it while it is unchanged", async () => {
+		await writeSession(sessionPath(), [header(), assistant("a1")]);
 
-async function writeSessionFile(options?: { includeCost?: boolean }): Promise<void> {
-	const sessionDir = path.join(getSessionsDir(), "--tmp--sync-serial");
-	await fs.mkdir(sessionDir, { recursive: true });
-	const timestamp = new Date().toISOString();
-	const sessionFile = path.join(sessionDir, "session.jsonl");
-	const includeCost = options?.includeCost ?? true;
-	const assistant = {
-		type: "message",
-		id: "assistant-1",
-		parentId: null,
-		timestamp,
-		message: {
-			role: "assistant",
-			content: [{ type: "text", text: "ok" }],
-			api: "openai-responses",
-			provider: "openai",
-			model: "gpt-5.4",
-			usage: {
-				input: 1,
-				output: 2,
-				cacheRead: 0,
-				cacheWrite: 0,
-				totalTokens: 3,
-				...(includeCost ? { cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } : {}),
-			},
-			stopReason: "stop",
-			timestamp: Date.now(),
-			duration: 10,
-			ttft: 5,
-		},
-	};
-	await Bun.write(sessionFile, `${JSON.stringify(assistant)}\n`);
-}
-
-describe("stats sync serial mode", () => {
-	it("honors workers: 1 without spawning a worker", async () => {
-		await writeSessionFile();
-		const workerSpy = vi.spyOn(globalThis, "Worker");
-
-		const synced = await syncAllSessions({ workers: 1 });
-		const overall = getOverallStats();
-
-		expect(synced.files).toBe(1);
-		expect(overall.totalRequests).toBe(1);
-		expect(workerSpy).not.toHaveBeenCalled();
+		expect(await syncAllSessions({ workers: 1 })).toEqual({ processed: 1, files: 1 });
+		expect(getOverallStats().totalRequests).toBe(1);
+		expect(await syncAllSessions()).toEqual({ processed: 0, files: 0 });
 	});
 
-	it("skips gc compress scratch copies but keeps transcripts in other dot directories", async () => {
-		await writeSessionFile();
-		const folder = path.join(getSessionsDir(), "--tmp--sync-serial");
-		const scratch = path.join(folder, ".omp-gc-compress-a1b2c3");
-		const hidden = path.join(folder, "session", ".runs");
-		await fs.mkdir(scratch);
-		await fs.mkdir(hidden, { recursive: true });
-		await fs.copyFile(path.join(folder, "session.jsonl"), path.join(scratch, "session.jsonl"));
-		await fs.copyFile(path.join(folder, "session.jsonl"), path.join(hidden, "child.jsonl"));
+	it("scans session roots recursively, dot directories included", async () => {
+		const file = await writeSession(sessionPath(), [header(), assistant("a1")]);
+		const nested = path.join(path.dirname(file), "session", ".runs", "child.jsonl");
+		await writeSession(nested, [header(), assistant("child")]);
 
-		const synced = await syncAllSessions({ workers: 1 });
-
-		expect(synced.files).toBe(2);
+		expect((await syncAllSessions({ workers: 1 })).files).toBe(2);
+		expect(getRecentRequests(5).find(row => row.entryId === "child")?.agentType).toBe("subagent");
 	});
 
-	it("syncs legacy session usage without a cost breakdown", async () => {
-		await writeSessionFile({ includeCost: false });
+	it("prices legacy session usage that has no cost breakdown from the rate card", async () => {
+		await initDb();
+		setModelPrices([{ provider: "openai", model: "gpt-x", input: 2, output: 8, cacheRead: 0, cacheWrite: 0 }]);
+		await writeSession(sessionPath(), [assistant("a1", { message: { usage: usage({ cost: undefined }) } })]);
 
-		const synced = await syncAllSessions({ workers: 1 });
-		const overall = getOverallStats();
-
-		expect(synced).toEqual({ processed: 1, files: 1 });
-		expect(overall.totalRequests).toBe(1);
-		expect(overall.totalCost).toBeGreaterThan(0);
+		expect(await syncAllSessions({ workers: 1 })).toEqual({ processed: 1, files: 1 });
+		expect(getOverallStats().totalCost).toBeCloseTo((10 * 2 + 5 * 8) / 1_000_000, 12);
 	});
 
-	it("uses the serial parser by default on macOS", async () => {
-		await writeSessionFile();
-		vi.spyOn(process, "platform", "get").mockReturnValue("darwin");
-		const workerSpy = vi.spyOn(globalThis, "Worker");
+	it("syncs only the named files when a watcher passes them", async () => {
+		const first = await writeSession(sessionPath("first.jsonl"), [assistant("a1")]);
+		await writeSession(sessionPath("second.jsonl"), [assistant("a2")]);
 
-		const synced = await syncAllSessions();
-		const overall = getOverallStats();
+		await syncAllSessions({ files: [first] });
 
-		expect(synced.files).toBe(1);
-		expect(overall.totalRequests).toBe(1);
-		expect(workerSpy).not.toHaveBeenCalled();
+		expect(getRecentRequests(5).map(row => row.entryId)).toEqual(["a1"]);
 	});
 
-	it("spawns no worker when every transcript is unchanged", async () => {
-		await writeSessionFile();
+	it("stores the header's cwd as the folder, also for Windows paths", async () => {
+		await writeSession(sessionPath("win.jsonl", "--C--Users-x-my-proj--"), [header("C:\\Users\\x\\my-proj"), assistant("win")]);
+		await writeSession(sessionPath("wt.jsonl", "--work-app-.worktrees-lane-src--"), [
+			header("/work/app/.worktrees/lane/src"),
+			assistant("worktree"),
+		]);
+		// No usable header: the lossy directory name is all there is.
+		await writeSession(sessionPath("bare.jsonl", "--home-me-proj--"), [assistant("bare")]);
+
 		await syncAllSessions({ workers: 1 });
-		const workerSpy = vi.spyOn(globalThis, "Worker");
 
-		const synced = await syncAllSessions({ workers: 2 });
-
-		expect(synced).toEqual({ processed: 0, files: 0 });
-		expect(workerSpy).not.toHaveBeenCalled();
+		expect(
+			getStatsByFolder()
+				.map(folder => folder.folder)
+				.sort(),
+		).toEqual(["/home/me/proj", "/work/app", "C:/Users/x/my-proj"]);
 	});
 
-	it("parses a few already-tracked transcripts inline by default", async () => {
-		await writeSessionFile();
+	it("scans a custom flat session dir and remembers it for later launches", async () => {
+		const custom = isolation.current()?.join("custom-sessions");
+		if (!custom) throw new Error("no temp dir");
+		await writeSession(path.join(custom, "flat.jsonl"), [header("/work/elsewhere"), assistant("flat")]);
+		addSessionRoot(custom);
+
 		await syncAllSessions({ workers: 1 });
-		const sessionFile = path.join(getSessionsDir(), "--tmp--sync-serial", "session.jsonl");
-		await fs.appendFile(sessionFile, "\n");
-		vi.spyOn(process, "platform", "get").mockReturnValue("linux");
-		const workerSpy = vi.spyOn(globalThis, "Worker");
+		expect(getRecentRequests(5)).toMatchObject([{ entryId: "flat", agentType: "main", folder: "/work/elsewhere" }]);
 
-		await syncAllSessions({ files: [sessionFile] });
-
-		expect(workerSpy).not.toHaveBeenCalled();
-	});
-
-	it("spawns a worker pool when callers explicitly request workers: 2 with a single file", async () => {
-		await writeSessionFile();
-		const workerProbe = new Error("worker probe");
-		const workerSpy = vi.spyOn(globalThis, "Worker").mockImplementation(() => {
-			throw workerProbe;
-		});
-
-		await expect(syncAllSessions({ workers: 2 })).rejects.toBe(workerProbe);
-		expect(workerSpy).toHaveBeenCalled();
+		// A later process (the standalone bin) never hears about the dir from pi: the database remembers it.
+		closeDb();
+		await fs.appendFile(path.join(custom, "flat.jsonl"), `${JSON.stringify(assistant("later", { timestamp: Date.now() }))}\n`);
+		await syncAllSessions({ workers: 1 });
+		expect(getSessionRoots()).toContain(path.resolve(custom));
+		expect(getOverallStats(null).totalRequests).toBe(2);
 	});
 });

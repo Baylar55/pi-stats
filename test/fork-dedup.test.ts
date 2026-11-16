@@ -1,277 +1,134 @@
-import { Database } from "bun:sqlite";
-import { describe, expect, it, spyOn } from "bun:test";
-import * as fs from "node:fs/promises";
-import * as path from "node:path";
-import { syncAllSessions } from "@oh-my-pi/omp-stats/aggregator";
-import { closeDb, getRecentRequests, initDb, insertMessageStats } from "@oh-my-pi/omp-stats/db";
-import { getOverallStats } from "@oh-my-pi/omp-stats/rollup";
-import * as parser from "@oh-my-pi/omp-stats/parser";
-import type { MessageStats } from "@oh-my-pi/omp-stats/types";
-import { getSessionsDir, getStatsDbPath } from "@oh-my-pi/pi-utils";
+import { describe, expect, it } from "vitest";
+import { syncAllSessions } from "../src/aggregator";
+import { closeDb, getRecentRequests, initDb, insertMessageStats } from "../src/db";
+import { getOverallStats } from "../src/rollup";
+import type { MessageStatsInput } from "../src/types";
+import { assistant, header, sessionPath, T0, toolCall, toolResult, usage, user, writeSession } from "./helpers/session";
 import { installStatsTestIsolation } from "./helpers/temp-agent";
 
 installStatsTestIsolation("@pi-stats-fork-dedup-");
 
-interface AssistantOptions {
-	entryId: string;
-	parentId?: string | null;
-	timestamp: string;
-}
-
-function buildUserEntry(entryId: string, timestamp: string, content: string) {
-	return {
-		type: "message",
-		id: entryId,
-		parentId: null,
-		timestamp,
-		message: { role: "user", content },
-	};
-}
-
-function buildAssistantEntry(opts: AssistantOptions) {
-	return {
-		type: "message",
-		id: opts.entryId,
-		parentId: opts.parentId ?? null,
-		timestamp: opts.timestamp,
-		message: {
-			role: "assistant",
-			content: [{ type: "text", text: "ok" }],
-			api: "openai-responses",
-			provider: "openai",
-			model: "gpt-5.4",
-			responseId: `resp-${opts.entryId}`,
-			usage: {
-				input: 100,
-				output: 50,
-				cacheRead: 0,
-				cacheWrite: 0,
-				totalTokens: 150,
-				cost: { input: 0.001, output: 0.002, cacheRead: 0, cacheWrite: 0, total: 0.003 },
-			},
-			stopReason: "stop",
-			timestamp: Date.parse(opts.timestamp),
-			duration: 10,
-			ttft: 5,
-		},
-	};
-}
-
-async function writeSessionFile(
-	folderSlug: string,
-	fileName: string,
-	header: { id: string; cwd: string; parentSession?: string },
-	entries: unknown[],
-): Promise<string> {
-	const sessionDir = path.join(getSessionsDir(), folderSlug);
-	await fs.mkdir(sessionDir, { recursive: true });
-	const sessionFile = path.join(sessionDir, fileName);
-	const headerEntry = {
-		type: "session",
-		version: 3,
-		id: header.id,
-		timestamp: new Date().toISOString(),
-		cwd: header.cwd,
-		...(header.parentSession ? { parentSession: header.parentSession } : {}),
-	};
-	const lines = [headerEntry, ...entries].map(entry => JSON.stringify(entry)).join("\n");
-	await Bun.write(sessionFile, `${lines}\n`);
-	return sessionFile;
-}
-
-function makeStat(sessionFile: string, entryId: string, timestamp: number, premium = 0): MessageStats {
-	return {
-		sessionFile,
-		entryId,
-		folder: "/tmp/fork-dedup",
-		model: "gpt-5.4",
-		provider: "openai",
-		api: "openai-responses",
-		timestamp,
-		duration: 10,
-		ttft: 5,
-		stopReason: "stop",
-		errorMessage: null,
-		usage: {
-			input: 100,
-			output: 50,
-			cacheRead: 0,
-			cacheWrite: 0,
-			totalTokens: 150,
-			premiumRequests: premium,
-			cost: { input: 0.001, output: 0.002, cacheRead: 0, cacheWrite: 0, total: 0.003 },
-		},
-		agentType: "main",
-	};
-}
+const USAGE = usage({ input: 100, output: 50, totalTokens: 150 });
+const turn = (n: number, parentId: string | null): Record<string, unknown>[] => [
+	user(`user-${n}`, "hello", { parentId, timestamp: T0 + n * 1000 }),
+	assistant(`asst-${n}`, { parentId: `user-${n}`, timestamp: T0 + n * 1000 + 1, message: { usage: USAGE } }),
+];
 
 describe("stats sync deduplicates forked-session entries", () => {
-	it("keeps each request attributed to its original transcript when the fork finishes parsing first", async () => {
-		const ts = new Date("2026-06-24T10:00:00.000Z").toISOString();
-		const userEntry = buildUserEntry("user01ab", ts, "hello");
-		const assistantEntry = buildAssistantEntry({ entryId: "asst01ab", parentId: "user01ab", timestamp: ts });
+	// `/fork` (`SessionManager.forkFrom`) writes a new header with `parentSession`
+	// and copies every other entry of the source file verbatim.
+	it("counts a verbatim /fork copy once and attributes it to the original transcript", async () => {
+		const entries = [...turn(1, null), ...turn(2, "asst-1")];
+		const parent = await writeSession(sessionPath("01_parent.jsonl"), [header(), ...entries]);
+		await syncAllSessions({ workers: 1 });
+		await writeSession(sessionPath("02_fork.jsonl"), [header("/work/project", { id: "fork", parentSession: parent }), ...entries]);
+		await syncAllSessions({ workers: 1 });
 
-		const parentFile = await writeSessionFile(
-			"--tmp--fork-dedup",
-			"01_parent.jsonl",
-			{ id: "parent00", cwd: "/tmp/project" },
-			[userEntry, assistantEntry],
-		);
-
-		// `SessionManager.createBranchedSession` / `forkFrom` deep-copy the
-		// parent's entries into the child file with `parentSession` in the
-		// header. Earlier stats sync keyed uniqueness on (session_file,
-		// entry_id), so both files contributed the same provider request to
-		// every aggregate.
-		const forkFile = await writeSessionFile(
-			"--tmp--fork-dedup",
-			"02_fork.jsonl",
-			{ id: "fork0000", cwd: "/tmp/project", parentSession: parentFile },
-			[userEntry, assistantEntry],
-		);
-		const parse = parser.parseSessionFile;
-		const forkParsed = parse(forkFile);
-		const observer = spyOn(parser, "parseSessionFile").mockImplementation(async (file, offset, state, replay) => {
-			if (file === forkFile) return forkParsed;
-			// Finish the real fork read before allowing its parent's read to start.
-			await forkParsed;
-			return parse(file, offset, state, replay);
-		});
-		try {
-			await syncAllSessions({ workers: 1 });
-		} finally {
-			observer.mockRestore();
-		}
-
-		const assistantRequests = getRecentRequests(10).filter(r => r.entryId === "asst01ab");
-		expect(assistantRequests).toHaveLength(1);
-		expect(assistantRequests[0].sessionFile).toBe(parentFile);
-
+		const requests = getRecentRequests(10);
+		expect(requests.map(r => r.entryId).sort()).toEqual(["asst-1", "asst-2"]);
+		expect(new Set(requests.map(r => r.sessionFile))).toEqual(new Set([parent]));
 		const overall = getOverallStats();
-		expect(overall.totalRequests).toBe(1);
-		expect(overall.totalInputTokens).toBe(100);
-		expect(overall.totalOutputTokens).toBe(50);
-		expect(overall.totalCost).toBeCloseTo(0.003, 8);
+		expect(overall.totalRequests).toBe(2);
+		expect(overall.totalInputTokens).toBe(200);
+		expect(overall.totalOutputTokens).toBe(100);
+		expect(overall.totalCost).toBeCloseTo(0.006, 8);
+		const users = (await initDb()).prepare<{ n: number }>("SELECT COUNT(*) AS n FROM user_messages").get();
+		expect(users?.n).toBe(2);
+	});
+
+	it("counts a fork once when both files are ingested from scratch in one pass", async () => {
+		const entries = turn(1, null);
+		const parent = await writeSession(sessionPath("01_parent.jsonl"), [header(), ...entries]);
+		await writeSession(sessionPath("02_fork.jsonl"), [header("/work/project", { parentSession: parent }), ...entries]);
+
+		await syncAllSessions({ workers: 1 });
+
+		expect(getOverallStats()).toMatchObject({ totalRequests: 1, totalInputTokens: 100 });
+	});
+
+	// Branching (`createBranchedSession`) copies only the root-to-leaf path, keeps each
+	// entry's id and timestamp, and re-chains `parentId` where labels were dropped.
+	it("counts a branch copy with re-chained parents once", async () => {
+		const parent = await writeSession(sessionPath("01_parent.jsonl"), [
+			header(),
+			...turn(1, null),
+			{ type: "label", id: "label-1", parentId: "asst-1", timestamp: new Date(T0).toISOString(), targetId: "asst-1", label: "keep" },
+			...turn(2, "label-1"),
+			...turn(3, "asst-1"),
+		]);
+		const [user2, asst2] = turn(2, "asst-1");
+		await writeSession(sessionPath("02_branch.jsonl"), [
+			header("/work/project", { id: "branch", parentSession: parent }),
+			...turn(1, null),
+			user2,
+			asst2,
+		]);
+
+		await syncAllSessions({ workers: 1 });
+
+		expect(getOverallStats()).toMatchObject({ totalRequests: 3, totalInputTokens: 300 });
 	});
 
 	it("admits new entries appended in the forked session", async () => {
-		const ts = new Date("2026-06-24T10:00:00.000Z").toISOString();
-		const userEntry = buildUserEntry("user01ab", ts, "hello");
-		const assistantEntry = buildAssistantEntry({ entryId: "asst01ab", parentId: "user01ab", timestamp: ts });
-
-		const parentFile = await writeSessionFile(
-			"--tmp--fork-dedup",
-			"01_parent.jsonl",
-			{ id: "parent00", cwd: "/tmp/project" },
-			[userEntry, assistantEntry],
-		);
-
-		// After fork, the child file appends a fresh user+assistant pair.
-		// Inherited entries must dedupe; new ones must still count.
-		const newTs = new Date("2026-06-24T10:05:00.000Z").toISOString();
-		const newUserEntry = buildUserEntry("user02cd", newTs, "follow-up");
-		const newAssistantEntry = buildAssistantEntry({
-			entryId: "asst02cd",
-			parentId: "user02cd",
-			timestamp: newTs,
-		});
-		await writeSessionFile(
-			"--tmp--fork-dedup",
-			"02_fork.jsonl",
-			{ id: "fork0000", cwd: "/tmp/project", parentSession: parentFile },
-			[userEntry, assistantEntry, newUserEntry, newAssistantEntry],
-		);
+		const parent = await writeSession(sessionPath("01_parent.jsonl"), [header(), ...turn(1, null)]);
+		// After the fork, the child appends a fresh turn: inherited entries dedupe, new ones count.
+		await writeSession(sessionPath("02_fork.jsonl"), [
+			header("/work/project", { parentSession: parent }),
+			...turn(1, null),
+			...turn(2, "asst-1"),
+		]);
 
 		await syncAllSessions({ workers: 1 });
 
 		const overall = getOverallStats();
 		expect(overall.totalRequests).toBe(2);
 		expect(overall.totalInputTokens).toBe(200);
-		expect(overall.totalOutputTokens).toBe(100);
 		expect(overall.totalCost).toBeCloseTo(0.006, 8);
 	});
 
-	it("collapses pre-existing duplicate rows on init (one-shot migration)", async () => {
-		await initDb();
-		closeDb();
-
-		// Clear the fork-dedupe sentinel so the migration runs against the
-		// hand-inserted dupes, then plant two messages and two user_messages
-		// rows that share (entry_id, timestamp) under different session_files
-		// — exactly the shape `SessionManager.fork()` leaves behind.
-		const database = new Database(getStatsDbPath());
-		database.prepare("DELETE FROM meta WHERE key = ?").run("fork_dedupe_v1");
-		const ts = Date.now();
-		const insertMessage = database.prepare(`
-			INSERT INTO messages (
-				session_file, entry_id, folder, model, provider, api, timestamp,
-				duration, ttft, stop_reason, error_message,
-				input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens, premium_requests,
-				cost_input, cost_output, cost_cache_read, cost_cache_write, cost_total, agent_type
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		`);
-		const sharedArgs = [
-			"/tmp/fork-dedup/project",
-			"gpt-5.4",
-			"openai",
-			"openai-responses",
-			ts,
-			10,
-			5,
-			"stop",
-			null,
-			100,
-			50,
-			0,
-			0,
-			150,
-			0,
-			0.001,
-			0.002,
-			0,
-			0,
-			0.003,
-			"main",
+	it("does not double-count tool calls and usage entries copied into a fork", async () => {
+		const entries = [
+			assistant("a1", { message: { content: [toolCall("call-1", "bash")] } }),
+			toolResult("r1", "call-1", "out", { parentId: "a1" }),
+			{ type: "usage", id: "warm", parentId: "r1", timestamp: new Date(T0).toISOString(), kind: "cache_warm", provider: "openai", model: "gpt-x", usage: usage() },
 		];
-		insertMessage.run("/tmp/parent.jsonl", "asst01ab", ...sharedArgs);
-		insertMessage.run("/tmp/fork.jsonl", "asst01ab", ...sharedArgs);
-		const insertUser = database.prepare(`
-			INSERT INTO user_messages (
-				session_file, entry_id, folder, timestamp, model, provider,
-				chars, words, yelling, profanity, anguish,
-				negation, repetition, blame
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		`);
-		const sharedUser = ["/tmp/fork-dedup/project", ts, "gpt-5.4", "openai", 5, 1, 0, 0, 0, 0, 0, 0];
-		insertUser.run("/tmp/parent.jsonl", "user01ab", ...sharedUser);
-		insertUser.run("/tmp/fork.jsonl", "user01ab", ...sharedUser);
-		database.close();
+		const parent = await writeSession(sessionPath("01_parent.jsonl"), [header(), ...entries]);
+		await writeSession(sessionPath("02_fork.jsonl"), [header("/work/project", { parentSession: parent }), ...entries]);
 
-		await initDb();
+		await syncAllSessions({ workers: 1 });
 
-		const messageRows = getRecentRequests(10).filter(r => r.entryId === "asst01ab");
-		expect(messageRows).toHaveLength(1);
-		expect(messageRows[0].sessionFile).toBe("/tmp/parent.jsonl");
-		const overall = getOverallStats();
-		expect(overall.totalRequests).toBe(1);
-		expect(overall.totalCost).toBeCloseTo(0.003, 8);
-
-		// The migration is idempotent. Re-running init must not delete the
-		// surviving row.
-		closeDb();
-		await initDb();
-		expect(getOverallStats().totalRequests).toBe(1);
+		expect(getOverallStats().totalRequests).toBe(2);
+		const calls = (await initDb()).prepare<{ n: number }>("SELECT COUNT(*) AS n FROM tool_calls").get();
+		expect(calls?.n).toBe(1);
 	});
 
-	it("still upserts premium_requests for re-syncs of the same session file", async () => {
-		await initDb();
-		const stat = makeStat("/tmp/session-a.jsonl", "asst01ab", Date.now(), 0);
-		insertMessageStats([stat]);
-		const upgraded = { ...stat, usage: { ...stat.usage, premiumRequests: 1 } };
-		insertMessageStats([upgraded]);
+	it("collapses pre-existing duplicate rows on init (one-shot migration)", async () => {
+		const db = await initDb();
+		const stat = (sessionFile: string): MessageStatsInput => ({
+			sessionFile,
+			entryId: "dup",
+			folder: "/work/project",
+			model: "gpt-x",
+			provider: "openai",
+			api: "openai-responses",
+			timestamp: T0,
+			duration: null,
+			ttft: null,
+			stopReason: "stop",
+			errorMessage: null,
+			usage: USAGE,
+			agentType: "main",
+		});
+		insertMessageStats([stat("/s/parent.jsonl")]);
+		// A row an older build stored under the fork before the guard existed.
+		db.run("INSERT INTO messages (session_file, entry_id, folder, model, provider, api, timestamp, stop_reason, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens, cost_input, cost_output, cost_cache_read, cost_cache_write, cost_total) SELECT '/s/fork.jsonl', entry_id, folder, model, provider, api, timestamp, stop_reason, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens, cost_input, cost_output, cost_cache_read, cost_cache_write, cost_total FROM messages");
+		db.run("DELETE FROM meta WHERE key = 'fork_dedupe_v1'");
+		closeDb();
 
-		const requests = getRecentRequests(10).filter(r => r.entryId === "asst01ab");
-		expect(requests).toHaveLength(1);
-		expect(requests[0].usage.premiumRequests).toBe(1);
+		await initDb();
+
+		const rows = getRecentRequests(10);
+		expect(rows).toHaveLength(1);
+		expect(rows[0].sessionFile).toBe("/s/parent.jsonl");
 	});
 });

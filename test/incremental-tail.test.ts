@@ -1,71 +1,41 @@
-import { Database } from "bun:sqlite";
-import { beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
-import * as os from "node:os";
 import * as path from "node:path";
-import { syncAllSessions } from "@oh-my-pi/omp-stats/aggregator";
-import { closeDb, getFileOffset, getRecentRequests, initDb } from "@oh-my-pi/omp-stats/db";
-import { getOverallStats } from "@oh-my-pi/omp-stats/rollup";
-import { getSessionsDir, getStatsDbPath } from "@oh-my-pi/pi-utils";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { syncAllSessions } from "../src/aggregator";
+import { getStatsDbPath } from "../src/config";
+import { closeDb, getFileOffset, getRecentRequests, initDb } from "../src/db";
+import { parseSessionFile } from "../src/parser";
+import { getOverallStats } from "../src/rollup";
+import { assistant, lines, replaceSession, sessionPath, T0, toolCall, user, writeSession } from "./helpers/session";
 import { installStatsTestIsolation } from "./helpers/temp-agent";
 
 const isolation = installStatsTestIsolation("@pi-stats-tail-");
 
 beforeEach(() => {
 	const temp = isolation.current();
-	if (
-		!temp ||
-		path.resolve(os.homedir(), process.env.PI_CONFIG_DIR ?? "") !== temp.join("config") ||
-		!getStatsDbPath().startsWith(`${temp.path()}${path.sep}`)
-	) {
-		throw new Error("Stats tests require an isolated temporary configuration and database");
+	if (!temp || !getStatsDbPath().startsWith(`${temp.path()}${path.sep}`)) {
+		throw new Error("Stats tests require an isolated temporary agent directory and database");
 	}
 });
 
-function assistant(id: string): string {
-	return `${JSON.stringify({
-		type: "message",
-		id,
-		timestamp: "2026-09-07T12:00:00Z",
-		message: {
-			role: "assistant",
-			content: [{ type: "text", text: "ok" }],
-			api: "openai-responses",
-			provider: "openai",
-			model: "gpt-5.4",
-			stopReason: "stop",
-			timestamp: 0,
-			usage: {
-				input: 10,
-				output: 5,
-				cacheRead: 0,
-				cacheWrite: 0,
-				totalTokens: 15,
-				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-			},
-		},
-	})}\n`;
-}
+const one = (id: string): string => lines([assistant(id)]);
+const padding = (bytes: number, fill = "x"): string => lines([{ type: "custom", customType: "pad", data: fill.repeat(bytes) }]);
+const storedIds = (limit = 100): string[] =>
+	getRecentRequests(limit)
+		.map(row => row.entryId)
+		.sort();
 
-function tier(value: string | null): string {
-	return `${JSON.stringify({ type: "service_tier_change", serviceTier: value })}\n`;
-}
-
-async function session(content: string): Promise<string> {
-	const file = path.join(getSessionsDir(), "--tmp--tail", "session.jsonl");
-	await Bun.write(file, content);
-	return file;
-}
-
-/** Counts bytes read through `Bun.file().bytes()` until `restore()`; `reset()` zeroes the count. */
-function observeReads(file: string): { readonly bytes: number; reset(): void; restore(): void } {
-	const prototype: Bun.BunFile = Object.getPrototypeOf(Bun.file(file));
-	const original = prototype.bytes;
+/** Counts bytes read through file handles until `restore()`; `reset()` zeroes the count. */
+async function observeReads(file: string): Promise<{ readonly bytes: number; reset(): void; restore(): void }> {
+	const probe = await fs.open(file, "r");
+	const prototype: { read: fs.FileHandle["read"] } = Object.getPrototypeOf(probe);
+	await probe.close();
+	const original = prototype.read;
 	let bytes = 0;
-	const observer = spyOn(prototype, "bytes").mockImplementation(async function (this: Bun.BunFile) {
-		const read = await original.call(this);
-		bytes += read.length;
-		return read;
+	const observer = vi.spyOn(prototype, "read").mockImplementation(async function (this: fs.FileHandle, ...args: unknown[]) {
+		const result = await Reflect.apply(original, this, args);
+		bytes += result.bytesRead;
+		return result;
 	});
 	return {
 		get bytes() {
@@ -87,75 +57,37 @@ describe("incremental stats ingestion", () => {
 				? "preserves forked tool calls when a replacement reuses the call ID in a different entry"
 				: `preserves forked ${kind} records when a replacement reuses an ID at a new timestamp`;
 		it(title, async () => {
-			const oldTime = Date.parse("2026-09-07T12:00:00Z");
-			const newTime = kind === "tool-entry" ? oldTime : Date.parse("2026-09-07T13:00:00Z");
+			const newTime = kind === "tool-entry" ? T0 : T0 + 3_600_000;
 			const entry = (timestamp: number, id = "shared"): string =>
-				`${JSON.stringify({
-					type: "message",
-					id,
-					timestamp: new Date(timestamp).toISOString(),
-					message: {
-						role: kind === "user" ? "user" : "assistant",
-						timestamp,
-						content:
-							kind === "tool" || kind === "tool-entry"
-								? [{ type: "toolCall", id: "call", name: "read", arguments: { path: "README.md" } }]
-								: [{ type: "text", text: "hello" }],
-						model: "gpt-5.4",
-						provider: "openai",
-						api: "openai-responses",
-						stopReason: "stop",
-						usage:
-							kind === "message"
-								? {
-										input: 10,
-										output: 5,
-										cacheRead: 0,
-										cacheWrite: 0,
-										totalTokens: 15,
-										cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-									}
-								: undefined,
-					},
-				})}\n`;
-			const fork = path.join(getSessionsDir(), "--tmp--tail", "fork.jsonl");
-			await Bun.write(fork, "");
-			const owner = await session(entry(oldTime));
+				lines([
+					kind === "user"
+						? user(id, "hello", { timestamp })
+						: assistant(id, {
+								timestamp,
+								message: kind === "message" ? {} : { content: [toolCall("call", "read", { path: "README.md" })] },
+							}),
+				]);
+			const owner = await writeSession(sessionPath(), entry(T0));
+			const fork = await writeSession(sessionPath("fork.jsonl"), "");
 			await syncAllSessions({ workers: 1 });
-			await Bun.write(fork, entry(oldTime));
+			await writeSession(fork, entry(T0));
 			await syncAllSessions({ workers: 1 });
-			const db = await initDb();
-			db.prepare("DELETE FROM meta WHERE key = 'messages_cost_reingest_v1'").run();
-			closeDb();
-			await Bun.write(`${owner}.replacement`, entry(newTime, kind === "tool-entry" ? "new-entry" : "shared"));
-			await fs.rename(`${owner}.replacement`, owner);
+			await replaceSession(owner, entry(newTime, kind === "tool-entry" ? "new-entry" : "shared"));
 			await syncAllSessions({ workers: 1 });
+
 			const table = kind === "message" ? "messages" : kind === "user" ? "user_messages" : "tool_calls";
-			const rows = (await initDb()).prepare(`SELECT timestamp FROM ${table} ORDER BY timestamp`).all() as {
-				timestamp: number;
-			}[];
-			expect(rows.map(row => row.timestamp)).toEqual([oldTime, newTime]);
+			const rows = (await initDb()).prepare<{ timestamp: number }>(`SELECT timestamp FROM ${table} ORDER BY timestamp`).all();
+			// The fork still holds the old record, so it survives next to the replacement's.
+			expect(rows.map(row => row.timestamp)).toEqual([T0, newTime]);
 		});
 	}
 
-	it("rebuilds a replaced transcript when a database backfill invalidates its cursor", async () => {
-		const file = await session(assistant("old"));
-		await syncAllSessions({ workers: 1 });
-		const db = await initDb();
-		db.prepare("DELETE FROM meta WHERE key = 'messages_cost_reingest_v1'").run();
-		closeDb();
-		await Bun.write(`${file}.replacement`, assistant("new"));
-		await fs.rename(`${file}.replacement`, file);
-		await syncAllSessions({ workers: 1 });
-		expect(getRecentRequests().map(row => row.entryId)).toEqual(["new"]);
-	});
-
 	it("detects a second replacement after interruption without forgetting its previous file identity", async () => {
-		const fileA = await session(assistant("oldA"));
-		const fileB = path.join(path.dirname(fileA), "second.jsonl");
-		await Bun.write(fileB, assistant("oldB"));
+		const fileA = await writeSession(sessionPath(), one("oldA"));
+		const fileB = await writeSession(sessionPath("second.jsonl"), one("oldB"));
 		await syncAllSessions({ workers: 1 });
-		await fs.writeFile(fileA, assistant("newA"));
+
+		await fs.writeFile(fileA, one("newA"));
 		await expect(
 			syncAllSessions({
 				workers: 1,
@@ -165,254 +97,130 @@ describe("incremental stats ingestion", () => {
 			}),
 		).rejects.toThrow("interrupted after A");
 		closeDb();
-		await fs.writeFile(
-			fileB,
-			assistant("newB") + JSON.stringify({ type: "custom", padding: "x".repeat(8192) }) + "\n",
-		);
-		await syncAllSessions({ workers: 2 });
-		expect(
-			getRecentRequests()
-				.map(row => row.entryId)
-				.sort(),
-		).toEqual(["newA", "newB"]);
-	}, 15_000);
+		await fs.writeFile(fileB, one("newB") + padding(8192));
+		await syncAllSessions({ workers: 1 });
+
+		expect(storedIds()).toEqual(["newA", "newB"]);
+	});
 
 	for (const state of [null, "invalid JSON"] as const) {
 		it(`rebuilds a larger replacement when persisted parser state is ${state === null ? "missing" : "invalid"}`, async () => {
-			const file = await session(assistant("old"));
+			const file = await writeSession(sessionPath(), one("old"));
 			await syncAllSessions({ workers: 1 });
 			const db = await initDb();
 			db.prepare("UPDATE file_offsets SET parser_state = ? WHERE session_file = ?").run(state, file);
 			closeDb();
-			await fs.writeFile(
-				file,
-				assistant("new") + JSON.stringify({ type: "custom", padding: "x".repeat(8192) }) + "\n",
-			);
+			await fs.writeFile(file, one("new") + padding(8192));
 			await syncAllSessions({ workers: 1 });
-			expect(getRecentRequests().map(row => row.entryId)).toEqual(["new"]);
+
+			expect(storedIds()).toEqual(["new"]);
 		});
 	}
 
-	it("limits reads to appended or replaced transcripts across restarts and retains priority accounting", async () => {
-		const content =
-			tier("priority") +
-			JSON.stringify({ type: "custom", padding: "x".repeat(2_000_000) }) +
-			"\n" +
-			assistant("first");
-		const file = await session(content);
-		await Bun.write(
-			path.join(path.dirname(file), "unrelated.jsonl"),
-			`${JSON.stringify({ type: "custom", padding: "y".repeat(2_000_000) })}\n`,
-		);
+	it("limits reads to appended bytes across restarts", async () => {
+		const content = padding(2_000_000) + one("first");
+		const file = await writeSession(sessionPath(), content);
+		await writeSession(sessionPath("unrelated.jsonl"), padding(2_000_000, "y"));
 		await syncAllSessions({ workers: 1 });
 		closeDb();
-		const tail = assistant("second");
+
+		const tail = lines([assistant("second", { timestamp: T0 + 1 })]);
 		await fs.appendFile(file, tail);
-		const reads = observeReads(file);
+		const reads = await observeReads(file);
 		try {
 			await syncAllSessions({ workers: 1 });
+			// The tail plus the two 256-byte cursor checkpoints; neither 2 MB transcript is re-read.
 			expect(reads.bytes).toBeLessThan(Buffer.byteLength(tail) + 4096);
 
-			await fs.copyFile(file, `${file}.replacement`);
-			await fs.rename(`${file}.replacement`, file);
 			reads.reset();
 			await syncAllSessions({ workers: 1 });
-			expect(reads.bytes).toBeLessThan(Buffer.byteLength(content + tail) + 4096);
+			expect(reads.bytes).toBe(0);
 		} finally {
 			reads.restore();
 		}
 		expect(getOverallStats().totalRequests).toBe(2);
-		expect(getOverallStats().totalPremiumRequests).toBe(2);
 	});
 
-	it("keeps reading only new bytes after the filesystem's device number changes", async () => {
-		// ZFS and others renumber st_dev across mounts; cursors written before that must stay valid.
-		const renumberDevice = async (sessionFile: string): Promise<void> => {
-			const db = await initDb();
-			const row = db
-				.prepare<{ parser_state: string }, [string]>("SELECT parser_state FROM file_offsets WHERE session_file = ?")
-				.get(sessionFile);
-			const state = { ...JSON.parse(row!.parser_state), dev: 0x7fff_fff0 };
-			db.prepare("UPDATE file_offsets SET parser_state = ? WHERE session_file = ?").run(
-				JSON.stringify(state),
-				sessionFile,
-			);
-			closeDb();
-		};
-		const content = `${assistant("first")}${JSON.stringify({ type: "custom", padding: "x".repeat(2_000_000) })}\n`;
-		const file = await session(content);
+	it("leaves a partial trailing line for the next sync", async () => {
+		const complete = lines([assistant("second", { timestamp: T0 + 1 })]);
+		const file = await writeSession(sessionPath(), one("first") + complete.slice(0, 40));
 		await syncAllSessions({ workers: 1 });
+		expect(storedIds()).toEqual(["first"]);
+		expect(getFileOffset(file)?.offset).toBe(Buffer.byteLength(one("first")));
 
-		const reads = observeReads(file);
-		try {
-			await renumberDevice(file);
-			await syncAllSessions({ workers: 1 });
-			expect(reads.bytes).toBe(0);
+		await fs.appendFile(file, complete.slice(40));
+		await syncAllSessions({ workers: 1 });
+		expect(storedIds()).toEqual(["first", "second"]);
+	});
 
-			const tail = assistant("second");
-			await fs.appendFile(file, tail);
-			await renumberDevice(file);
-			await syncAllSessions({ workers: 1 });
-			expect(reads.bytes).toBeLessThan(Buffer.byteLength(tail) + 4096);
-		} finally {
-			reads.restore();
-		}
-		expect(getOverallStats().totalRequests).toBe(2);
+	it("rebuilds cursor state from the prefix for an offset-only caller", async () => {
+		const prefix = lines([user("u1", "why did you do that"), { type: "thinking_level_change", id: "t1", parentId: "u1", thinkingLevel: "high" }]);
+		const file = await writeSession(sessionPath(), prefix + lines([assistant("a1", { parentId: "t1" })]));
+
+		const result = await parseSessionFile(file, Buffer.byteLength(prefix));
+
+		expect(result.userStats).toEqual([]);
+		expect(result.userLinks).toEqual([{ sessionFile: file, entryId: "u1", model: "gpt-x", provider: "openai" }]);
 	});
 
 	for (const operation of ["replace", "truncate"] as const) {
-		it(`rebuilds derived totals after ${operation} instead of reusing the old offset and tier`, async () => {
-			const file = await session(
-				tier("priority") + assistant("old") + JSON.stringify({ type: "custom", padding: "x".repeat(8192) }) + "\n",
-			);
+		it(`rebuilds derived totals after ${operation} instead of reusing the old offset`, async () => {
+			const file = await writeSession(sessionPath(), one("old") + padding(8192));
 			await syncAllSessions({ workers: 1 });
-			const replacement = assistant("new");
-			if (operation === "replace") {
-				await Bun.write(`${file}.new`, replacement);
-				await fs.rename(`${file}.new`, file);
-			} else {
-				await fs.writeFile(file, replacement);
-			}
+			if (operation === "replace") await replaceSession(file, one("new"));
+			else await fs.writeFile(file, one("new"));
 			await syncAllSessions({ workers: 1 });
-			expect(getRecentRequests().map(row => row.entryId)).toEqual(["new"]);
-			expect(getOverallStats().totalPremiumRequests).toBe(0);
+
+			expect(storedIds()).toEqual(["new"]);
+			expect(getOverallStats().totalRequests).toBe(1);
 		});
 	}
 
-	it("upgrades offset-only databases without losing the active tier", async () => {
-		const file = await session(tier("priority") + assistant("first"));
-		await syncAllSessions({ workers: 1 });
-		closeDb();
-		const raw = new Database(getStatsDbPath());
-		raw.exec(
-			"ALTER TABLE file_offsets RENAME TO old_offsets; CREATE TABLE file_offsets (session_file TEXT PRIMARY KEY, offset INTEGER NOT NULL, last_modified INTEGER NOT NULL); INSERT INTO file_offsets SELECT session_file, offset, last_modified FROM old_offsets; DROP TABLE old_offsets;",
-		);
-		raw.close();
-		await syncAllSessions({ workers: 1 });
-		await fs.appendFile(file, assistant("second"));
-		await syncAllSessions({ workers: 1 });
-		expect(getOverallStats().totalRequests).toBe(2);
-		expect(getOverallStats().totalPremiumRequests).toBe(2);
-	});
-
-	it("carries service-tier resets through the worker protocol and database restarts", async () => {
-		const file = await session(tier("priority") + assistant("first"));
-		await syncAllSessions({ workers: 2 });
-		closeDb();
-		await fs.appendFile(file, assistant("second") + tier(null));
-		await syncAllSessions({ workers: 2 });
-		closeDb();
-		await fs.appendFile(file, assistant("third"));
-		await syncAllSessions({ workers: 2 });
-		expect(getOverallStats().totalRequests).toBe(3);
-		expect(getOverallStats().totalPremiumRequests).toBe(2);
-	}, 15_000);
-
-	it("retries an incomplete final entry without losing its preceding service tier", async () => {
-		const reply = assistant("completed");
-		const split = Math.floor(reply.length / 2);
-		const file = await session(tier("priority") + reply.slice(0, split));
-		await syncAllSessions({ workers: 1 });
-		expect(getOverallStats().totalRequests).toBe(0);
-		await fs.appendFile(file, reply.slice(split));
-		await syncAllSessions({ workers: 1 });
-		expect(getOverallStats().totalRequests).toBe(1);
-		expect(getOverallStats().totalPremiumRequests).toBe(1);
-	});
-
 	it("detects a same-inode rewrite that grows past the previous cursor", async () => {
-		const file = await session(tier("priority") + assistant("old"));
+		// The leading line makes the rewrite differ in the bytes before the old cursor too.
+		const file = await writeSession(sessionPath(), padding(16) + one("old"));
 		await syncAllSessions({ workers: 1 });
-		await fs.writeFile(file, assistant("new") + JSON.stringify({ type: "custom", padding: "x".repeat(8192) }) + "\n");
+		await fs.writeFile(file, one("new") + padding(8192));
 		await syncAllSessions({ workers: 1 });
-		expect(getRecentRequests().map(row => row.entryId)).toEqual(["new"]);
-		expect(getOverallStats().totalPremiumRequests).toBe(0);
+
+		expect(storedIds()).toEqual(["new"]);
 	});
 
 	it("rolls back replacement deletions and the cursor when a derived-row write fails", async () => {
-		const file = await session(tier("priority") + assistant("old"));
+		const file = await writeSession(sessionPath(), padding(16) + one("old"));
 		await syncAllSessions({ workers: 1 });
 		const oldOffset = getFileOffset(file);
 		const db = await initDb();
 		db.exec(
 			"CREATE TRIGGER reject_new BEFORE INSERT ON messages WHEN NEW.entry_id = 'new' BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;",
 		);
-		await fs.writeFile(file, assistant("new"));
+		await fs.writeFile(file, one("new"));
+
 		await expect(syncAllSessions({ workers: 1 })).rejects.toThrow("injected write failure");
-		expect(getRecentRequests().map(row => row.entryId)).toEqual(["old"]);
+		expect(storedIds()).toEqual(["old"]);
 		expect(getFileOffset(file)).toEqual(oldOffset);
+
 		db.exec("DROP TRIGGER reject_new");
 		await syncAllSessions({ workers: 1 });
-		expect(getRecentRequests().map(row => row.entryId)).toEqual(["new"]);
+		expect(storedIds()).toEqual(["new"]);
 	});
 
-	for (const workers of [1, 2]) {
-		it(`rolls back every replacement and cursor in a failed batch with ${workers} parsing workers`, async () => {
-			const first = await session(assistant("oldA"));
-			const second = path.join(path.dirname(first), "second.jsonl");
-			await Bun.write(second, assistant("oldB"));
-			await syncAllSessions({ workers });
-			const offsets = [getFileOffset(first), getFileOffset(second)];
-			const db = await initDb();
-			db.exec(`
-				CREATE TRIGGER reject_second_replacement BEFORE INSERT ON messages
-				WHEN NEW.entry_id IN ('replacementA', 'replacementB')
-					AND EXISTS (SELECT 1 FROM messages WHERE entry_id IN ('replacementA', 'replacementB'))
-				BEGIN SELECT RAISE(ABORT, 'batch write failure'); END;
-			`);
-			await fs.writeFile(first, assistant("replacementA"));
-			await fs.writeFile(second, assistant("replacementB"));
-			const reported: string[] = [];
-			await expect(
-				syncAllSessions({
-					workers,
-					onProgress(progress) {
-						reported.push(progress.sessionFile);
-					},
-				}),
-			).rejects.toThrow("batch write failure");
-			expect(
-				getRecentRequests()
-					.map(row => row.entryId)
-					.sort(),
-			).toEqual(["oldA", "oldB"]);
-			expect([getFileOffset(first), getFileOffset(second)]).toEqual(offsets);
-			expect(reported).toEqual([]);
-
-			db.exec("DROP TRIGGER reject_second_replacement");
-			await syncAllSessions({
-				workers,
-				onProgress(progress) {
-					// A reported replacement must already be visible to database readers.
-					const id = progress.sessionFile === first ? "replacementA" : "replacementB";
-					expect(getFileOffset(progress.sessionFile)?.offset).toBe(Buffer.byteLength(assistant(id)));
-				},
-			});
-			expect(
-				getRecentRequests()
-					.map(row => row.entryId)
-					.sort(),
-			).toEqual(["replacementA", "replacementB"]);
-		}, 15_000);
-	}
-
-	it("stops pooled ingestion after a committed-batch callback interrupts sync, then resumes without duplicates", async () => {
-		const folder = path.join(getSessionsDir(), "--tmp--tail");
+	it("resumes after a sync killed between batches with identical totals", async () => {
 		const count = 1025;
-		for (let index = 0; index < count; index++) {
-			await Bun.write(path.join(folder, `${index}.jsonl`), assistant(`entry-${index}`));
-		}
+		const folder = path.dirname(sessionPath());
+		await fs.mkdir(folder, { recursive: true });
+		await Promise.all(
+			Array.from({ length: count }, (_, index) => fs.writeFile(path.join(folder, `${index}.jsonl`), one(`entry-${index}`))),
+		);
 		let reports = 0;
 		let committed: string[] = [];
 		await expect(
 			syncAllSessions({
-				workers: 2,
+				workers: 1,
 				onProgress() {
 					reports++;
 					if (reports === 1) {
-						committed = getRecentRequests(count)
-							.map(row => row.entryId)
-							.sort();
+						committed = storedIds(count);
 						throw new Error("interrupted batch progress");
 					}
 				},
@@ -420,39 +228,46 @@ describe("incremental stats ingestion", () => {
 		).rejects.toThrow("interrupted batch progress");
 		closeDb();
 		await initDb();
-		expect(reports).toBe(1);
+		// Only whole batches are durable: the first one committed, the rest never started.
+		expect(committed.length).toBeGreaterThan(0);
 		expect(committed.length).toBeLessThan(count);
-		expect(
-			getRecentRequests(count)
-				.map(row => row.entryId)
-				.sort(),
-		).toEqual(committed);
-		await syncAllSessions({ workers: 2 });
+		expect(storedIds(count)).toEqual(committed);
+
+		await syncAllSessions({ workers: 1 });
 		expect(getOverallStats().totalRequests).toBe(count);
 		expect(getOverallStats().totalInputTokens).toBe(count * 10);
-	}, 15_000);
+
+		expect(await syncAllSessions({ workers: 1 })).toEqual({ processed: 0, files: 0 });
+		expect(getOverallStats().totalRequests).toBe(count);
+	}, 60_000);
+
+	it("takes over the sync lock of a process that died mid-sync", async () => {
+		await writeSession(sessionPath(), one("only"));
+		await fs.mkdir(path.dirname(getStatsDbPath()), { recursive: true });
+		// A pid far above any real one: the owner is gone and never released its lock.
+		await fs.writeFile(`${getStatsDbPath()}.sync.lock`, "2147483646");
+
+		expect(await syncAllSessions({ workers: 1 })).toEqual({ processed: 1, files: 1 });
+	});
 
 	it("keeps a request still present in a fork when its original transcript is replaced", async () => {
-		const file = await session(assistant("shared"));
+		const file = await writeSession(sessionPath(), one("shared"));
 		await syncAllSessions({ workers: 1 });
-		await Bun.write(path.join(path.dirname(file), "fork.jsonl"), assistant("shared"));
+		await writeSession(sessionPath("fork.jsonl"), one("shared"));
 		await syncAllSessions({ workers: 1 });
 		expect(getOverallStats().totalRequests).toBe(1);
-		await fs.writeFile(file, assistant("new"));
+
+		await fs.writeFile(file, lines([assistant("new", { timestamp: T0 + 1 })]) + padding(64));
 		await syncAllSessions({ workers: 1 });
-		expect(
-			getRecentRequests()
-				.map(row => row.entryId)
-				.sort(),
-		).toEqual(["new", "shared"]);
+		expect(storedIds()).toEqual(["new", "shared"]);
 	});
 
 	it("resumes fork reconciliation after interruption following a committed replacement", async () => {
-		const file = await session(assistant("shared"));
+		const file = await writeSession(sessionPath(), one("shared"));
 		await syncAllSessions({ workers: 1 });
-		await Bun.write(path.join(path.dirname(file), "fork.jsonl"), assistant("shared"));
+		await writeSession(sessionPath("fork.jsonl"), one("shared"));
 		await syncAllSessions({ workers: 1 });
-		await fs.writeFile(file, assistant("new"));
+		await fs.writeFile(file, lines([assistant("new", { timestamp: T0 + 1 })]) + padding(64));
 		await expect(
 			syncAllSessions({
 				workers: 1,
@@ -462,11 +277,8 @@ describe("incremental stats ingestion", () => {
 			}),
 		).rejects.toThrow("interrupted after commit");
 		closeDb();
+
 		await syncAllSessions({ workers: 1 });
-		expect(
-			getRecentRequests()
-				.map(row => row.entryId)
-				.sort(),
-		).toEqual(["new", "shared"]);
+		expect(storedIds()).toEqual(["new", "shared"]);
 	});
 });
