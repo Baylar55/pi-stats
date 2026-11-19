@@ -4,7 +4,7 @@
  * Host-free: it never imports `@earendil-works/*` values.
  */
 import { parseArgs, styleText } from "node:util";
-import { getDashboardStats } from "./aggregator";
+import { DEFAULT_TIME_RANGE, getDashboardStats, isTimeRange, type TimeRange } from "./aggregator";
 import { formatErrorRate } from "./client/data/formatters";
 import { DEFAULT_STATS_DASHBOARD_HOST, DEFAULT_STATS_DASHBOARD_PORT } from "./command";
 import { type RequestTiming, recordTiming } from "./db";
@@ -18,6 +18,7 @@ export {
 	type SyncOptions,
 	type SyncProgress,
 	syncAllSessions,
+	type TimeRange,
 } from "./aggregator";
 export { isLoopbackHost, nonLoopbackWarning } from "./command";
 export { addSessionRoot, getAgentDir, getSessionRoots, getStatsDbPath, setAgentDir } from "./config";
@@ -69,12 +70,12 @@ function formatCost(n: number, unpricedRequests = 0): string {
 	return `$${n.toFixed(2)}`;
 }
 
-/** Print the dashboard summary to the console (`pi-stats --summary`). */
-export async function printStatsSummary(): Promise<void> {
-	const stats = await getDashboardStats();
+/** Print the dashboard summary for `range` (default 24h) to the console (`pi-stats --summary`). */
+export async function printStatsSummary(range: TimeRange = DEFAULT_TIME_RANGE): Promise<void> {
+	const stats = await getDashboardStats(range);
 	const { overall, byModel, byFolder } = stats;
 
-	console.log(bold("\n=== AI Usage Statistics ===\n"));
+	console.log(bold(`\n=== AI Usage Statistics (${range === "all" ? "all time" : `last ${range}`}) ===\n`));
 
 	console.log(bold("Overall:"));
 	console.log(`  Requests: ${formatNumber(overall.totalRequests)} (${formatNumber(overall.failedRequests)} errors)`);
@@ -119,10 +120,12 @@ export interface StandaloneStatsArgs {
 	host: string;
 	json: boolean;
 	summary: boolean;
+	/** Window of `--json` and `--summary`. */
+	range: TimeRange;
 	help: boolean;
 }
 
-/** Parse the `pi-stats` bin arguments; loopback unless a host is given. Throws on an unknown flag or a bad port. */
+/** Parse the `pi-stats` bin arguments; loopback unless a host is given. Throws on an unknown flag, a bad port or range. */
 export function parseStandaloneStatsArgs(args: string[]): StandaloneStatsArgs {
 	const { values } = parseArgs({
 		args,
@@ -131,17 +134,21 @@ export function parseStandaloneStatsArgs(args: string[]): StandaloneStatsArgs {
 			host: { type: "string", default: DEFAULT_STATS_DASHBOARD_HOST },
 			json: { type: "boolean", short: "j", default: false },
 			summary: { type: "boolean", short: "s", default: false },
+			range: { type: "string", short: "r", default: DEFAULT_TIME_RANGE },
 			help: { type: "boolean", short: "h", default: false },
 		},
 		allowPositionals: true,
 	});
 	const port = /^\d+$/.test(values.port) ? Number(values.port) : Number.NaN;
 	if (!Number.isInteger(port) || port > 65_535) throw new Error(`Invalid port: ${values.port}`);
+	const range = values.range.trim().toLowerCase();
+	if (!isTimeRange(range)) throw new Error(`Invalid range: ${values.range} (use 1h, 24h, 7d, 30d, 90d or all)`);
 	return {
 		port,
 		host: values.host || DEFAULT_STATS_DASHBOARD_HOST,
 		json: values.json,
 		summary: values.summary,
+		range,
 		help: values.help,
 	};
 }

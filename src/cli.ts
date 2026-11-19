@@ -30,16 +30,18 @@ Usage:
   pi-stats [options]
 
 Options:
-  -p, --port <port>  Port for the dashboard server (default: 3847)
-  --host <host>      Host to bind (default: 127.0.0.1)
-  -s, --summary      Sync session files and print a summary
-  -j, --json         Sync session files and print the stats as JSON
-  -h, --help         Show this help message
+  -p, --port <port>    Port for the dashboard server (default: 3847)
+  --host <host>        Host to bind (default: 127.0.0.1)
+  -s, --summary        Sync session files and print a summary
+  -j, --json           Sync session files and print the stats as JSON
+  -r, --range <range>  Window of --summary and --json: 1h, 24h, 7d, 30d, 90d or all (default: 24h)
+  -h, --help           Show this help message
 
 Examples:
   pi-stats                 # Start the dashboard server
-  pi-stats --summary       # Print a summary to the console
-  pi-stats --json          # Print stats as JSON
+  pi-stats --summary       # Print a summary of the last 24 hours
+  pi-stats -s -r all       # Print an all-time summary
+  pi-stats --json -r 7d    # Print the last 7 days as JSON
   pi-stats --host 0.0.0.0  # Explicitly expose on all IPv4 interfaces
 `;
 
@@ -134,9 +136,9 @@ async function main(): Promise<void> {
 		const total = await getTotalMessageCount();
 		process.stderr.write(`Synced ${processed} new entries from ${files} files (${total} total)\n\n`);
 		if (args.json) {
-			console.log(JSON.stringify(await getDashboardStats(), null, 2));
+			console.log(JSON.stringify(await getDashboardStats(args.range), null, 2));
 		} else {
-			await printStatsSummary();
+			await printStatsSummary(args.range);
 		}
 		closeDb();
 		return;

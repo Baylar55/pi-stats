@@ -14,8 +14,15 @@ describe("standalone stats CLI", () => {
 			host: "127.0.0.1",
 			json: false,
 			summary: false,
+			range: "24h",
 			help: false,
 		});
+	});
+
+	it("takes the --summary/--json window and rejects an unknown one instead of falling back to 24h", () => {
+		expect(parseStandaloneStatsArgs(["-s", "-r", "ALL"]).range).toBe("all");
+		expect(parseStandaloneStatsArgs(["--json", "--range=7d"]).range).toBe("7d");
+		expect(() => parseStandaloneStatsArgs(["--range", "2d"])).toThrow("Invalid range: 2d");
 	});
 
 	it("forwards explicit bind hosts and formats IPv6 dashboard URLs", () => {
