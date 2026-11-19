@@ -156,3 +156,54 @@ change is listed) · **omitted** (no pi data source; the reason is listed).
 | `client-number-format`, `client-query`, `client-view-models`, `model-color-consistency`, `errors-route-range`, `trace-scale`, `trace-lane-axes` | ported |
 | `gain-aggregator` | project-path normalization cases ported as `projects`; snapcompact cases omitted |
 | `spotlight`, `spotlight-measures`, `embedded-client-archive`, `smoke-worker-darwin`, `behavior-backfill`, `priority-premium-requests` | omitted: test omp-only data, packaging, or legacy-DB migrations |
+
+### Cases dropped inside ported files
+
+| omp file | Dropped case | Reason |
+|---|---|---|
+| `agent-type` | adds the column and reclassifies legacy rows by transcript path on init | legacy-DB migration; pi-stats DB always had `agent_type` |
+| `db-cost` | reprices zero-cost rows when the backfill last ran for an older release | per-release backfill sentinel not ported; pi-stats re-prices when the rate card changes |
+| `db-cost` | leaves zero-cost rows alone when the backfill already ran for this release | same |
+| `db-cost` | refreshes a historically zero-cost multi-agent row with orchestration usage on re-ingest | pi `Usage` has no orchestration buckets |
+| `db-cost` | prices missing legacy costs at each response timestamp and retains the resulting history | pi's rate card is undated (current registry prices) |
+| `db-cost` | reprices recorded zeros on a dated rate card at the card in force for each request | same |
+| `db-cost` | reports a scheduled request with no recoverable timestamp as unpriced, not free | dated/scheduled pricing not ported |
+| `db-cost` | preserves recorded scheduled charges, including explicit zero, on ingest and reopen | same; pi re-prices a recorded zero at the public rate |
+| `fork-dedup` | still upserts premium_requests for re-syncs of the same session file | premium requests are omp-only (F12) |
+| `frustration` | merges provider/spelling variants and orders by class, revision, then family | rows are per provider/model; no catalog family merging |
+| `frustration` | groups DeepSeek Flash aliases and V4 provider variants without merging Pro or V4.1 into V4 | same |
+| `gain-aggregator` | scopes snapcompact records by selected project and keeps path prefixes separator-aware | snapcompact journal is omp-only (F12) |
+| `incremental-tail` | rebuilds a replaced transcript when a database backfill invalidates its cursor | omp `messages_cost_reingest_v1` backfill not ported |
+| `incremental-tail` | keeps reading only new bytes after the filesystem's device number changes | cursor does not record `st_dev` |
+| `incremental-tail` | upgrades offset-only databases without losing the active tier | pi has no service tiers; no offset-only legacy DB |
+| `incremental-tail` | carries service-tier resets through the worker protocol and database restarts | pi has no service tiers |
+| `incremental-tail` | rolls back every replacement and cursor in a failed batch with 1 / 2 parsing workers | only the single-file rollback case is ported; tests run unbuilt (inline parsing) |
+| `parser-malformed-entries` | estimates the stored cost at the request timestamp instead of freezing zero | pi's rate card is undated |
+| `parser-malformed-entries` | leaves scheduled usage unpriced when the entry has no recoverable timestamp | dated/scheduled pricing not ported |
+| `parser-malformed-entries` | re-parses history to mark pre-existing unpriced rows once, then leaves offsets alone | legacy-DB migration |
+| `provider-stats` | derives consumption, cycles, peak utilization, and capacity from snapshot deltas | usage windows not ported (F12) |
+| `provider-stats` | withholds capacity extrapolation when too little of the window was consumed | same |
+| `provider-stats` | keeps windows with distinct limit ids separate | same |
+| `provider-stats` | never merges distinct limits sharing a window label | same |
+| `provider-stats` | suffixes the window label when the limit label lacks the duration | same |
+| `provider-stats` | groups Codex slots by recorded window across plans (2 variants) | same |
+| `provider-stats` | keeps same-duration Codex meters and windows of unknown duration apart | same |
+| `provider-stats` | sums all four token components per provider across clients, null when empty | reads omp's agent-DB usage snapshots; not ported |
+| `provider-stats` | returns rows at or after sinceMs and empty results without an agent db | same |
+| `provider-stats` | waits for a contended database instead of returning no snapshots | same |
+| `reply-links` | re-links stored rows once by re-parsing only the sessions holding unlinked messages | legacy-DB migration |
+| `server-port-conflict` | reclaims a version 1 dashboard without command identity | pi-stats never kills a listener; serves on a free port instead |
+| `server-port-conflict` | reclaims a headerless legacy dashboard | same |
+| `server-port-conflict` | reclaims a confirmed stats listener that fails the probe | same |
+| `sync-serial` | honors workers: 1 without spawning a worker | tests run unbuilt, where parsing is always inline |
+| `sync-serial` | skips gc compress scratch copies but keeps transcripts in other dot directories | pi never compresses sessions (`omp gc --compress` omitted) |
+| `sync-serial` | uses the serial parser by default on macOS | tests run unbuilt, where parsing is always inline |
+| `sync-serial` | spawns no worker when every transcript is unchanged | same |
+| `sync-serial` | parses a few already-tracked transcripts inline by default | same |
+| `sync-serial` | spawns a worker pool when callers explicitly request workers: 2 with a single file | same |
+| `tool-stats` | counts $name as error=$expected (`it.each`, 4 cases) | synthetic skipped tool calls do not occur in pi transcripts |
+| `tool-stats` | excludes skipped non-executions from error totals without dropping calls or real errors | same |
+| `trace-builder` | pairs reused background job ids with their own closes and keeps span ids unique | background jobs are omp-only |
+| `trace-builder` | closes jobs a wait or a proc cancel hands over, so turns end and idle time shows | same |
+| `trace-builder` | marks dateless scheduled usage as unpriced instead of free | dated/scheduled pricing not ported |
+| `trace-builder` | uses the session cwd for home-relative storage keys and keeps the legacy path fallback | omp storage keys and `.jsonl.gz`: pi writes plain `.jsonl` under F7 dirs |
