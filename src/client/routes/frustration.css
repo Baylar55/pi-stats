@@ -51,7 +51,7 @@
 	gap: 14px;
 }
 
-/* Many model classes: scroll sideways rather than wrap (the thumb tracks one row). */
+/* Many providers: scroll sideways rather than wrap (the thumb tracks one row). */
 .frustration-classes {
 	overflow-x: auto;
 	scrollbar-width: none;

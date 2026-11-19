@@ -1,6 +1,6 @@
 /**
  * Headline tiles for one trace: wall time split into model/tool/idle, then
- * turns, requests, tool calls, agents, tokens, cost.
+ * turns, requests, tool calls, agents (when the trace has any), tokens, cost.
  */
 
 import { formatCompact, formatElapsed, formatEstimatedCost, formatInteger, formatPercent } from "../data/formatters";
@@ -26,7 +26,7 @@ export function SummaryStrip({ summary }: SummaryStripProps) {
 				value={formatInteger(summary.requests)}
 				hint={`${formatInteger(summary.toolCalls)} tool calls`}
 			/>
-			<Stat size="sm" label="Agents" value={formatInteger(summary.subagents)} />
+			{summary.subagents > 0 && <Stat size="sm" label="Agents" value={formatInteger(summary.subagents)} />}
 			<Stat size="sm" label="Tokens" value={formatCompact(summary.totalTokens)} />
 			<Stat size="sm" label="Cost" value={formatEstimatedCost(summary.costTotal, summary.unpricedRequests)} />
 		</StatGrid>

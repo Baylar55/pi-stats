@@ -69,9 +69,11 @@ export function TracesRoute({ active, session, onOpenSession }: TracesRouteProps
 	}, [sessions.data, filter]);
 
 	const maxCost = useMemo(() => Math.max(0, ...filtered.map(row => row.costTotal)), [filtered]);
+	// pi has no subagents of its own: the column appears only when a nested transcript was indexed.
+	const hasAgents = useMemo(() => (sessions.data ?? []).some(row => row.subagents > 0), [sessions.data]);
 
-	const columns = useMemo<Column<SessionSummary>[]>(
-		() => [
+	const columns = useMemo<Column<SessionSummary>[]>(() => {
+		const all: Column<SessionSummary>[] = [
 			{
 				key: "title",
 				header: "Session",
@@ -150,9 +152,9 @@ export function TracesRoute({ active, session, onOpenSession }: TracesRouteProps
 				),
 				sort: row => row.costTotal,
 			},
-		],
-		[maxCost],
-	);
+		];
+		return hasAgents ? all : all.filter(column => column.key !== "subagents");
+	}, [maxCost, hasAgents]);
 
 	if (session !== null) {
 		return <TraceView file={session} active={active} onBack={() => onOpenSession(null)} />;
@@ -163,7 +165,7 @@ export function TracesRoute({ active, session, onOpenSession }: TracesRouteProps
 		<div className="stack traces-page">
 			<PageHeader
 				title="Traces"
-				description={`Recent sessions with subagent activity folded in. Open one to inspect its timeline. ${TIMING_NOTE}.`}
+				description={`Recent sessions. Open one to inspect its timeline. ${TIMING_NOTE}.`}
 			/>
 			<Card
 				title="Sessions"

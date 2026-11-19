@@ -53,10 +53,13 @@ function paintDensity(
 
 	const [d0, d1] = scale.domain;
 	const dSpan = Math.max(d1 - d0, 1e-9);
-	const buckets = STRIP_KINDS.map(() => new Float32Array(width));
+	// The agent strip only when the trace has agents; otherwise it would be a permanent empty band.
+	const hasAgents = tracks.some(track => track.spans.some(span => span.kind === "subagent"));
+	const kinds = hasAgents ? STRIP_KINDS : STRIP_KINDS.filter(kind => kind !== "subagent");
+	const buckets = kinds.map(() => new Float32Array(width));
 	for (const track of tracks) {
 		for (const span of track.spans) {
-			const k = STRIP_KINDS.indexOf(span.kind);
+			const k = kinds.indexOf(span.kind);
 			if (k === -1) continue;
 			const strip = buckets[k];
 			const x0 = Math.max(0, Math.floor(((scale.toU(span.start) - d0) / dSpan) * width));
@@ -64,10 +67,10 @@ function paintDensity(
 			for (let x = x0; x <= x1; x++) strip[x] = Math.min(1, strip[x] + 0.34);
 		}
 	}
-	const stripH = HEIGHT / STRIP_KINDS.length;
-	for (let k = 0; k < STRIP_KINDS.length; k++) {
+	const stripH = HEIGHT / kinds.length;
+	for (let k = 0; k < kinds.length; k++) {
 		const strip = buckets[k];
-		ctx.fillStyle = colors.category[STRIP_KINDS[k]];
+		ctx.fillStyle = colors.category[kinds[k]];
 		for (let x = 0; x < width; x++) {
 			if (strip[x] <= 0) continue;
 			ctx.globalAlpha = 0.25 + strip[x] * 0.75;

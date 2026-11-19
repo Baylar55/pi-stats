@@ -158,6 +158,12 @@ export function SessionTraceView({
 		return spans;
 	}, [tracks]);
 
+	// As with the lanes: the core kinds always, agents and background only when the trace has them.
+	const legend = useMemo(() => {
+		const present = new Set(allSpans.map(({ span }) => span.kind));
+		return LEGEND.filter(item => item.kind === "turn" || item.kind === "model" || item.kind === "tool" || present.has(item.kind));
+	}, [allSpans]);
+
 	const matches = useMemo(() => {
 		const needle = search.trim().toLowerCase();
 		if (!needle) return [];
@@ -364,7 +370,7 @@ export function SessionTraceView({
 							)}
 						</div>
 						<div className="traces-legend">
-							{LEGEND.map(item => (
+							{legend.map(item => (
 								<span key={item.kind} className="traces-legend-item">
 									<span className="swatch" style={{ background: `var(${CATEGORY_VARS[item.kind]})` }} />
 									{item.label}

@@ -48,7 +48,7 @@ const RUNNING_POLL_MS = 1_000;
 const MIN_MESSAGES = 50;
 /** Below this judged share a row is mostly classified by the regex fallback. */
 const MIN_JUDGED_SHARE = 0.5;
-/** Segmented-control value for "every model class". */
+/** Segmented-control value for "every provider". */
 const ALL_CLASSES = "*";
 
 export function FrustrationRoute({ active, range }: FrustrationRouteProps) {
@@ -74,7 +74,7 @@ export function FrustrationRoute({ active, range }: FrustrationRouteProps) {
 		<div className="page">
 			<PageHeader
 				title="Frustration"
-				description={`How often your messages sound annoyed, per model version, in ${meta.windowLabel}.`}
+				description={`How often your messages sound annoyed, per model, in ${meta.windowLabel}.`}
 			/>
 
 			<QueryView query={stats} skeleton={<ChartSkeleton height={96} />}>
@@ -101,7 +101,7 @@ export function FrustrationRoute({ active, range }: FrustrationRouteProps) {
 			<QueryView
 				query={stats}
 				skeleton={
-					<Card index={2} title="Frustration by model version">
+					<Card index={2} title="Frustration by model">
 						<ChartSkeleton height={340} />
 						<TableSkeleton rows={6} />
 					</Card>
@@ -640,7 +640,7 @@ function FrustrationModelsSection({ models, stale }: { models: FrustrationModelS
 
 	const classOptions = useMemo(
 		() => [
-			{ value: ALL_CLASSES, label: "All", title: "Every model class" },
+			{ value: ALL_CLASSES, label: "All", title: "Every provider" },
 			...[...classes].map(([modelClass, messages]) => ({
 				value: modelClass,
 				label: modelClass,
@@ -690,7 +690,7 @@ function FrustrationModelsSection({ models, stale }: { models: FrustrationModelS
 
 	if (models.length === 0) {
 		return (
-			<Card index={2} title="Frustration by model version" stale={stale}>
+			<Card index={2} title="Frustration by model" stale={stale}>
 				<EmptyState title="No user messages in this range" hint="Try a longer range." />
 			</Card>
 		);
@@ -702,15 +702,15 @@ function FrustrationModelsSection({ models, stale }: { models: FrustrationModelS
 		<>
 			<Card
 				index={2}
-				title="Frustration by model version"
-				description="Share of user messages per model version. Each bar reaches the annoyed rate; the subsets aimed at the assistant stack inside it."
+				title="Frustration by model"
+				description="Share of user messages per provider and model. Each bar reaches the annoyed rate; the subsets aimed at the assistant stack inside it."
 				stale={stale}
 			>
 				<div className="stack frustration-chart-body">
 					<div className="frustration-classes">
 						<Segmented
 							size="sm"
-							aria-label="Model class"
+							aria-label="Provider"
 							options={classOptions}
 							value={activeClass}
 							onChange={setSelectedClass}
@@ -829,7 +829,7 @@ function FrustrationChart({
 	if (rows.length === 0) {
 		return (
 			<div className="frustration-chart-empty">
-				<EmptyState title="No model versions match the filters" />
+				<EmptyState title="No models match the filters" />
 			</div>
 		);
 	}
@@ -959,7 +959,7 @@ function FrustrationTable({
 	return (
 		<Card
 			index={3}
-			title="Model versions"
+			title="Models"
 			description="Rates are shares of user messages; rows follow the chart filters."
 			flush
 			stale={stale}
@@ -969,7 +969,7 @@ function FrustrationTable({
 				rowKey={row => row.key}
 				columns={columns}
 				dense
-				empty={<EmptyState title="No model versions match the filters" />}
+				empty={<EmptyState title="No models match the filters" />}
 			/>
 		</Card>
 	);
