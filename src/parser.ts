@@ -16,7 +16,7 @@ import type {
 	UserMessageStats,
 } from "./types";
 import { computeUserMessageMetrics, judgeProse } from "./user-metrics";
-import { hashHex, isEnoent } from "./util";
+import { hashHex, isEnoent, logger } from "./util";
 
 /** Characters a persisted tool name may consist of without sanitization. */
 const TOOL_NAME_PATTERN = /^[\w.:-]+$/;
@@ -360,14 +360,17 @@ const LF = 0x0a;
 const CR = 0x0d;
 const jsonLineDecoder = new TextDecoder();
 
-function parseJsonLine(bytes: Uint8Array, start: number, end: number): SessionEntry | null {
+/** `"blank"`: an empty line; `"malformed"`: not JSON, or JSON that is not a session entry. */
+type ParsedLine = SessionEntry | "blank" | "malformed";
+
+function parseJsonLine(bytes: Uint8Array, start: number, end: number): ParsedLine {
 	while (end > start && bytes[end - 1] === CR) end--;
-	if (end <= start) return null;
+	if (end <= start) return "blank";
 	try {
 		const entry: unknown = JSON.parse(jsonLineDecoder.decode(bytes.subarray(start, end)));
-		return entry && typeof entry === "object" && "type" in entry ? (entry as SessionEntry) : null;
+		return entry && typeof entry === "object" && "type" in entry ? (entry as SessionEntry) : "malformed";
 	} catch {
-		return null;
+		return "malformed";
 	}
 }
 
@@ -407,7 +410,7 @@ function visitSessionEntriesLenient(bytes: Uint8Array, ids: LegacyIds, visit: En
 		const hasNewline = newline !== -1;
 		const lineEnd = hasNewline ? newline : bytes.length;
 		const entry = parseJsonLine(bytes, cursor, lineEnd);
-		if (entry) {
+		if (typeof entry === "object") {
 			ids.apply(entry, bytes.subarray(cursor, lineEnd));
 			visit(entry);
 			read = hasNewline ? newline + 1 : lineEnd;
@@ -435,7 +438,8 @@ const READ_CHUNK_BYTES = 1 << 20;
 /**
  * {@link visitSessionEntriesLenient} over `[start, end)` of an open file,
  * read in bounded chunks so a large transcript is never held in memory: each
- * entry is reduced by `visit` and dropped. Returns the offset consumed up to.
+ * entry is reduced by `visit` and dropped. Returns the offset consumed up to
+ * and the number of complete lines skipped as malformed.
  */
 async function visitFileRange(
 	handle: fs.FileHandle,
@@ -443,11 +447,12 @@ async function visitFileRange(
 	end: number,
 	ids: LegacyIds,
 	visit: EntryVisitor,
-): Promise<number> {
+): Promise<{ consumed: number; malformed: number }> {
 	let buffer = Buffer.allocUnsafe(Math.max(1, Math.min(READ_CHUNK_BYTES, end - start)));
 	let filled = 0;
 	let position = start;
 	let consumed = start;
+	let malformed = 0;
 	while (position < end) {
 		if (filled === buffer.length) {
 			const grown = Buffer.allocUnsafe(buffer.length * 2);
@@ -463,9 +468,11 @@ async function visitFileRange(
 		let cursor = 0;
 		for (let newline = window.indexOf(LF, cursor); newline !== -1; newline = window.indexOf(LF, cursor)) {
 			const entry = parseJsonLine(window, cursor, newline);
-			if (entry) {
+			if (typeof entry === "object") {
 				ids.apply(entry, window.subarray(cursor, newline));
 				visit(entry);
+			} else if (entry === "malformed") {
+				malformed++;
 			}
 			cursor = newline + 1;
 		}
@@ -479,13 +486,13 @@ async function visitFileRange(
 		// Unterminated last line: complete JSON is consumed, a partial write waits for the next sync.
 		const window = buffer.subarray(0, filled);
 		const entry = parseJsonLine(window, 0, filled);
-		if (entry) {
+		if (typeof entry === "object") {
 			ids.apply(entry, window);
 			visit(entry);
 			consumed += filled;
 		}
 	}
-	return consumed;
+	return { consumed, malformed };
 }
 
 /**
@@ -754,7 +761,12 @@ export async function parseSessionFile(
 				// No usable cursor state: rebuild it from the transcript prefix, collecting no rows.
 				await visitFileRange(handle, 0, start, ids, track);
 			}
-			newOffset = await visitFileRange(handle, start, info.size, ids, visit);
+			const range = await visitFileRange(handle, start, info.size, ids, visit);
+			newOffset = range.consumed;
+			// Each line is read once per tail, so a corrupt line is reported once (again only after a reset).
+			if (range.malformed > 0) {
+				logger.warn("Skipped malformed transcript lines", { file: sessionPath, lines: range.malformed });
+			}
 			checkpoint = hashHex(await readCheckpoint(handle, newOffset));
 		} finally {
 			await handle.close();
