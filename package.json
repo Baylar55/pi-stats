@@ -1,9 +1,18 @@
 {
-	"name": "pi-stats",
+	"name": "pi-stats-web",
 	"version": "0.1.0",
 	"description": "Local observability dashboard for pi: /stats opens a live web dashboard of AI usage statistics built from session transcripts (port of oh-my-pi's /stats)",
 	"type": "module",
 	"license": "MIT",
+	"author": "Baylar Sadigov <bylrsadiqov@gmail.com>",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/Baylar55/pi-stats.git"
+	},
+	"homepage": "https://github.com/Baylar55/pi-stats#readme",
+	"bugs": {
+		"url": "https://github.com/Baylar55/pi-stats/issues"
+	},
 	"keywords": [
 		"pi-package",
 		"pi",
