@@ -79,7 +79,6 @@ function splitModelId(id: string): [provider: string, model: string] {
 /** The Frustration judge: chat completions through pi's model registry, with the session's own auth. */
 function createJudge(ctx: ExtensionContext): Runtime.StatsJudge {
 	const registry = ctx.modelRegistry;
-	const sessionModel = ctx.model;
 	return {
 		models() {
 			const models: Runtime.StatsJudgeModel[] = [];
@@ -93,11 +92,15 @@ function createJudge(ctx: ExtensionContext): Runtime.StatsJudge {
 				const priced = model.cost.input > 0 || model.cost.output > 0;
 				models.push(priced ? { id, inputPrice: model.cost.input, outputPrice: model.cost.output } : { id });
 			};
-			// Default first: the configured judge, else the session's current model.
+			// Default first: the configured judge, else the session's current model (read now, so a
+			// `/model` change since `/stats` is followed).
 			const configured = configuredJudgeModel();
 			if (configured) add(registry.find(...splitModelId(configured)));
-			add(sessionModel);
-			for (const model of registry.getAvailable()) add(model);
+			add(ctx.model);
+			// A session scoped with `--models` or `enabledModels` offers its scope, not every available model.
+			const scoped = ctx.scopedModels;
+			if (scoped.length > 0) for (const { model } of scoped) add(model);
+			else for (const model of registry.getAvailable()) add(model);
 			return models;
 		},
 		async complete(modelId, prompt, signal) {
