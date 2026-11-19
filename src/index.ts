@@ -32,7 +32,6 @@ export {
 	formatStatsDashboardUrl,
 	type StartServerOptions,
 	type StatsServerHandle,
-	setStatsCloseHandler,
 	startServer,
 } from "./server";
 export type {

@@ -70,23 +70,9 @@ function clientDir(): string | null {
 /**
  * Required on every POST. A custom header forces a CORS preflight, which this
  * server never approves, so a hostile page cannot trigger a paid judge run (or
- * a sync, or a close) through a cross-site form or `fetch`.
+ * a sync) through a cross-site form or `fetch`.
  */
 const STATS_ACTION_HEADER = "X-Pi-Stats-Action";
-
-/** What the page's Close calls; unset, the page offers none. */
-let closeHandler: (() => void) | undefined;
-
-/**
- * Let the page close the dashboard: while `close` is set, it shows a Close
- * button (and takes Esc and Ctrl+C) that calls it. For a launcher that shows
- * the page in place of its own UI; `undefined` takes Close away again. pi
- * opens the system browser, where closing would leave a dead tab, so the
- * bundled launchers never set it.
- */
-export function setStatsCloseHandler(close: (() => void) | undefined): void {
-	closeHandler = close;
-}
 
 /** Refuse a POST that could have been sent by another site; null when it may proceed. */
 function rejectForeignPost(req: Request, url: URL): Response | null {
@@ -204,13 +190,6 @@ export async function handleApi(req: Request): Promise<Response> {
 		const details = await getRequestDetails(Number(id));
 		if (!details) return new Response("Not Found", { status: 404 });
 		return Response.json(details);
-	}
-
-	if (path === "/api/close") {
-		if (req.method !== "POST") return Response.json({ closable: closeHandler !== undefined });
-		if (!closeHandler) return Response.json({ error: "this dashboard is not closed from its page" }, { status: 404 });
-		closeHandler();
-		return new Response(null, { status: 202 });
 	}
 
 	if (path === "/api/sync") {

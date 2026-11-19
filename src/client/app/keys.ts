@@ -1,7 +1,6 @@
 /**
- * Guards for the dashboard's page-wide keys (`Shell`'s shortcuts,
- * `CloseButton`'s Esc and Ctrl+C): they stay out of fields being typed
- * in and out of open dialogs, which own their keys.
+ * Guards for the dashboard's page-wide keys (`Shell`'s shortcuts): they
+ * stay out of fields being typed in and out of open dialogs, which own their keys.
  */
 
 /** Whether `target` takes typing (a field, a select, editable content). */

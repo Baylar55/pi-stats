@@ -6,7 +6,7 @@
 import * as fs from "node:fs";
 import * as http from "node:http";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { type StatsServerHandle, setStatsCloseHandler, startServer } from "../src/server";
+import { type StatsServerHandle, startServer } from "../src/server";
 import { assistant, header, sessionPath, writeSession } from "./helpers/session";
 import { installStatsTestIsolation } from "./helpers/temp-agent";
 
@@ -21,7 +21,6 @@ beforeEach(async () => {
 });
 
 afterEach(() => {
-	setStatsCloseHandler(undefined);
 	server.stop();
 });
 
@@ -111,7 +110,7 @@ describe("same-origin enforcement", () => {
 	});
 
 	it("requires the action header and a same-origin Origin on every POST", async () => {
-		for (const path of ["/api/sync", "/api/frustration/judge", "/api/frustration/cancel", "/api/close"]) {
+		for (const path of ["/api/sync", "/api/frustration/judge", "/api/frustration/cancel"]) {
 			expect((await raw(path, { method: "POST" })).status, path).toBe(403);
 			const crossOrigin = await raw(path, { method: "POST", headers: { ...ACTION, Origin: "http://evil.example" } });
 			expect(crossOrigin.status, path).toBe(403);
@@ -138,19 +137,6 @@ describe("same-origin enforcement", () => {
 			const entry = await raw(`/api/session/entry?file=${encodeURIComponent(file)}&id=x`);
 			expect(entry.status, file).toBe(400);
 		}
-	});
-});
-
-describe("close button", () => {
-	it("is offered only while a launcher registered a way to close the page", async () => {
-		expect(JSON.parse((await raw("/api/close")).body)).toEqual({ closable: false });
-		expect((await raw("/api/close", { method: "POST", headers: ACTION })).status).toBe(404);
-
-		let closed = 0;
-		setStatsCloseHandler(() => closed++);
-		expect(JSON.parse((await raw("/api/close")).body)).toEqual({ closable: true });
-		expect((await raw("/api/close", { method: "POST", headers: ACTION })).status).toBe(202);
-		expect(closed).toBe(1);
 	});
 });
 
