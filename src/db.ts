@@ -85,7 +85,11 @@ export async function initDb(): Promise<Database> {
 	db.run("PRAGMA cache_size = -65536");
 	db.run("PRAGMA wal_autocheckpoint = 16384");
 
-	// Create tables
+	// Create tables. These raw tables are schema 1. `CREATE TABLE IF NOT EXISTS` never alters an
+	// existing table, so the first release that changes one must add a `schema_version` key to
+	// `meta` (absent = 1; a database created by that release starts at its version) and run its
+	// `ALTER TABLE` steps for older versions in an immediate transaction, re-reading the version
+	// inside it because another process may migrate concurrently. Rollup tables version themselves.
 	db.run(`
 		CREATE TABLE IF NOT EXISTS messages (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
