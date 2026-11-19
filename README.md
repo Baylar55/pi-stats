@@ -2,8 +2,6 @@
 
 Local observability dashboard for [pi](https://pi.dev): `/stats` opens a live web dashboard of AI usage statistics built from your session transcripts.
 
-A port of [oh-my-pi](https://github.com/can1357/oh-my-pi)'s `/stats` dashboard (`@oh-my-pi/omp-stats`, MIT) to a pi package. The ingest pipeline, storage schema, aggregations, HTTP API and React client are omp's, adapted to pi's session format and to Node. [PARITY.md](PARITY.md) lists every omp feature and what happened to it.
-
 ## Install
 
 ```bash
@@ -37,7 +35,7 @@ pi-stats --summary        # sync, then print a summary of the last 24 hours
 pi-stats --json -r all    # sync, then print getDashboardStats("all") as JSON
 ```
 
-`--range`/`-r` sets the window of `--summary` and `--json`: `1h`, `24h` (default, as in omp), `7d`, `30d`, `90d` or `all`.
+`--range`/`-r` sets the window of `--summary` and `--json`: `1h`, `24h` (default), `7d`, `30d`, `90d` or `all`.
 
 The bin has no judge: the Frustration page shows the regex fallback and says so.
 
@@ -78,7 +76,7 @@ Pages: Overview `o`, Models `m`, Providers `p`, Costs `c`, Requests `r`, Errors 
 
 ## Data
 
-- **Session logs**: every directory pi writes sessions to: `<agentDir>/sessions`, `PI_CODING_AGENT_SESSION_DIR`, the `sessionDir` setting, and the live session's own directory (covers `--session-dir`). Scanned recursively.
+- **Session logs**: every directory pi writes sessions to: `<agentDir>/sessions`, `PI_CODING_AGENT_SESSION_DIR`, the `sessionDir` setting, and the live session's own directory (covers `--session-dir`). Scanned recursively; a transcript an extension nests below a session is counted as a subagent of it.
 - **Stats database**: `<agentDir>/stats.db` (SQLite, WAL). A derived cache: delete it and the next sync rebuilds it, except live timings and judge verdicts.
 - **Log**: `<agentDir>/pi-stats.log` (warnings only, e.g. skipped malformed transcript lines or port conflicts; `PI_STATS_DEBUG=1` for more). Not rotated.
 
@@ -99,17 +97,6 @@ Transcripts contain code and secrets.
 - Binds to loopback by default; `--host` with a non-loopback address shows a warning.
 - No CORS headers. Requests whose `Host` header does not name the dashboard are refused (DNS rebinding). Every POST needs a custom header and, from a browser, a same-origin `Origin`.
 - Serves only the built client and the API. Transcript reads are confined to the session directories.
-
-## Differences from omp
-
-- **Omitted** (no pi data source): Gain (snapcompact savings), Spotlight (read-tool journal), provider subscription windows, premium requests, service tiers, advisor transcripts.
-- **Timing**: TTFT is live-capture only; see above.
-- **Cost**: rate card from pi's model registry instead of omp's bundled catalog.
-- **Browser**: system browser instead of a Tern pane; the page's Close button stays hidden.
-- **Port conflict**: an older dashboard on the port is never stopped (it lives inside someone's pi process); a free port is used instead.
-- **Frustration**: rows are per provider/model; the judge is a prompted chat completion, so verdict probabilities are 0 or 1.
-- **Subagents**: pi core writes no nested transcripts; a transcript nested below a session is tagged `subagent` if an extension writes one.
-- **Runtime**: `node:http` and `node:sqlite` (`bun:sqlite` under Bun) instead of `Bun.serve`.
 
 ## Development
 
