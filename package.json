@@ -30,7 +30,7 @@
 		]
 	},
 	"bin": {
-		"pi-stats": "./dist/cli.js"
+		"pi-stats": "dist/cli.js"
 	},
 	"main": "./dist/index.js",
 	"types": "./dist/types/index.d.ts",
