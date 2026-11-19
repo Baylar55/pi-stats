@@ -2,7 +2,9 @@
  * The one place that knows which SQLite the process has. The stats code is
  * written against `bun:sqlite`'s `Database` surface (as in omp); under Bun the
  * real class is used, under Node this adapter provides the same surface over
- * `node:sqlite`'s `DatabaseSync` (Node >= 22.13).
+ * `node:sqlite`'s `DatabaseSync` (Node >= 22.16 on 22.x, >= 24 after: `isTransaction` and `setReturnArrays`).
+ * Write SQL with `?` or `$name` parameters, never numbered `?1`: older `node:sqlite` releases
+ * (22.x and 24.0 at least) fail to bind them ("column index out of range").
  */
 import { createRequire } from "node:module";
 import type * as NodeSqlite from "node:sqlite";

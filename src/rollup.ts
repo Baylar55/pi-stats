@@ -384,23 +384,23 @@ export function refreshRollupBatch(limit: number): number {
 		const clearTools = database.query("DELETE FROM tool_rollup WHERE bucket = ?");
 		const fillMessages = database.query(`
 			INSERT INTO message_rollup (${MESSAGE_ROLLUP_COLUMNS})
-			SELECT ${messageFacts("?1", "")}
-			FROM messages WHERE timestamp >= ?1 AND timestamp < ?1 + ${HOUR_MS}
+			SELECT ${messageFacts("$bucket", "")}
+			FROM messages WHERE timestamp >= $bucket AND timestamp < $bucket + ${HOUR_MS}
 			GROUP BY ${MESSAGE_DIMENSIONS}
 		`);
 		const fillTools = database.query(`
 			INSERT INTO tool_rollup (${TOOL_ROLLUP_COLUMNS})
-			SELECT ${toolFacts("?1")}
+			SELECT ${toolFacts("$bucket")}
 			FROM tool_calls t ${TOOL_JOIN}
-			WHERE t.timestamp >= ?1 AND t.timestamp < ?1 + ${HOUR_MS}
+			WHERE t.timestamp >= $bucket AND t.timestamp < $bucket + ${HOUR_MS}
 			GROUP BY t.tool_name, t.model, t.provider
 		`);
 		const clean = database.query("DELETE FROM rollup_dirty WHERE bucket = ?");
 		for (const { bucket } of buckets) {
 			clearMessages.run(bucket);
 			clearTools.run(bucket);
-			fillMessages.run(bucket);
-			fillTools.run(bucket);
+			fillMessages.run({ $bucket: bucket });
+			fillTools.run({ $bucket: bucket });
 			clean.run(bucket);
 		}
 
@@ -410,14 +410,14 @@ export function refreshRollupBatch(limit: number): number {
 		const clearAgent = database.query("DELETE FROM tool_agent_rollup WHERE bucket = ?");
 		const fillAgent = database.query(`
 			INSERT INTO tool_agent_rollup (bucket, agent_type, result_chars)
-			SELECT ${toolAgentFacts("?1")}
-			FROM tool_calls WHERE timestamp >= ?1 AND timestamp < ?1 + ${HOUR_MS}
+			SELECT ${toolAgentFacts("$bucket")}
+			FROM tool_calls WHERE timestamp >= $bucket AND timestamp < $bucket + ${HOUR_MS}
 			GROUP BY agent_type
 		`);
 		const cleanAgent = database.query("DELETE FROM tool_agent_dirty WHERE bucket = ?");
 		for (const { bucket } of agentBuckets) {
 			clearAgent.run(bucket);
-			fillAgent.run(bucket);
+			fillAgent.run({ $bucket: bucket });
 			cleanAgent.run(bucket);
 		}
 
@@ -429,7 +429,7 @@ export function refreshRollupBatch(limit: number): number {
 		const fillSession = database.query(`
 			INSERT INTO session_rollup (${SESSION_ROLLUP_COLUMNS})
 			SELECT ${sessionFacts("m.")}
-			FROM messages m WHERE m.session_file = ?1
+			FROM messages m WHERE m.session_file = ?
 			GROUP BY m.session_file
 		`);
 		const cleanSession = database.query("DELETE FROM session_dirty WHERE session_file = ?");

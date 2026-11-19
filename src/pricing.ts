@@ -98,12 +98,12 @@ const PRICE_COLUMNS = "provider, model, input, output, cache_read, cache_write, 
  */
 const FIND_PRICE_SQL = `
 	SELECT ${PRICE_COLUMNS} FROM model_prices
-	WHERE model = ?1 AND (input <> 0 OR output <> 0 OR cache_read <> 0 OR cache_write <> 0)
-	ORDER BY provider = ?2 DESC, provider
+	WHERE model = $model AND (input <> 0 OR output <> 0 OR cache_read <> 0 OR cache_write <> 0)
+	ORDER BY provider = $provider DESC, provider
 	LIMIT 1`;
 
 function findPriceRow(database: Database, provider: string, model: string): PriceRow | null {
-	return database.query<PriceRow>(FIND_PRICE_SQL).get(model, provider);
+	return database.query<PriceRow>(FIND_PRICE_SQL).get({ $model: model, $provider: provider });
 }
 
 function toRates(row: PriceRow): ModelRates {

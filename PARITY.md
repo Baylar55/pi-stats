@@ -1,7 +1,7 @@
 # Parity matrix: oh-my-pi `/stats` → `pi-stats`
 
 Reference: [`can1357/oh-my-pi`](https://github.com/can1357/oh-my-pi) @ `7c49c11a` (`packages/stats`, MIT).
-Host: `@earendil-works/pi-coding-agent` 1.5.2 on Node ≥ 22.13 (verified against the installed
+Host: `@earendil-works/pi-coding-agent` 1.5.2 on Node 22.16+ or 24+ (verified against the installed
 `docs/*.md`, `dist/**/*.d.ts`, and 48 real transcripts under `~/.pi/agent/sessions`).
 
 Status legend: **ported** (same logic, runtime shims only) · **adapted** (pi forces a change; the
