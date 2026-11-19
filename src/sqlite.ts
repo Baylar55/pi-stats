@@ -1,6 +1,6 @@
 /**
  * The one place that knows which SQLite the process has. The stats code is
- * written against `bun:sqlite`'s `Database` surface (as in omp); under Bun the
+ * written against `bun:sqlite`'s `Database` surface; under Bun the
  * real class is used, under Node this adapter provides the same surface over
  * `node:sqlite`'s `DatabaseSync` (Node >= 22.16 on 22.x, >= 24 after: `isTransaction` and `setReturnArrays`).
  * Write SQL with `?` or `$name` parameters, never numbered `?1`: older `node:sqlite` releases

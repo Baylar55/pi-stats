@@ -1,7 +1,6 @@
 /**
- * Node replacements for the `@oh-my-pi/pi-utils` helpers and `Bun.*` calls the
- * omp stats code relies on. Formatting helpers are verbatim from
- * `packages/utils/src/format.ts`.
+ * Small runtime helpers: number/duration formatting, hashing, logging and a
+ * cross-process file lock.
  */
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
@@ -73,14 +72,6 @@ export function formatPercent(ratio: number): string {
 	return `${(ratio * 100).toFixed(1)}%`;
 }
 
-export function isRecord(value: unknown): value is Record<string, unknown> {
-	return !!value && typeof value === "object" && !Array.isArray(value);
-}
-
-export function toError(value: unknown): Error {
-	return value instanceof Error ? value : new Error(String(value));
-}
-
 /** The `code` of a Node system error, read without trusting an unchecked cast. */
 export function errorCode(err: unknown): string | undefined {
 	return err instanceof Error && "code" in err && typeof err.code === "string" ? err.code : undefined;
@@ -91,9 +82,8 @@ export function isEnoent(err: unknown): boolean {
 }
 
 /**
- * Stable 64-bit hex digest. Stands in for `Bun.hash(x).toString(16)`: the
- * values only key pi-stats' own rows (prose hashes, cursor checkpoints), so
- * the algorithm need not match omp's wyhash.
+ * Stable 64-bit hex digest. The values only key pi-stats' own rows (prose
+ * hashes, cursor checkpoints), so any stable hash does.
  */
 export function hashHex(data: string | Uint8Array): string {
 	return createHash("sha1").update(data).digest("hex").slice(0, 16);
@@ -156,8 +146,8 @@ function isStaleLock(lockPath: string): boolean {
 
 /**
  * Run `fn` while holding an exclusive cross-process lock for `filePath`
- * (`<filePath>.lock`, created with `wx`, holding the owner's pid). omp uses a
- * native OS lock here; Node has none, so a dead owner is detected by pid.
+ * (`<filePath>.lock`, created with `wx`, holding the owner's pid). Node has no
+ * native OS lock, so a dead owner is detected by pid.
  */
 export async function withFileLock<T>(
 	filePath: string,

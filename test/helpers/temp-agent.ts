@@ -1,8 +1,8 @@
 /**
  * Shared test isolation: every test gets a fresh agent directory (sessions +
  * stats.db) in a `TempDir`, and the stats DB handle is closed afterwards.
- * Port of omp's `test/helpers/temp-agent.ts`; pi has no XDG redirection, so
- * pinning the agent dir is all the isolation there is.
+ * pi has no XDG redirection, so pinning the agent dir is all the isolation
+ * there is.
  */
 import { afterEach, beforeEach } from "vitest";
 import { setAgentDir } from "../../src/config";

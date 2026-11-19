@@ -7,7 +7,7 @@ const REMOVE_RETRY_DELAY_MS = 50;
 const RETRYABLE: Record<string, true> = { EBUSY: true, EPERM: true, ENOTEMPTY: true };
 
 /**
- * Owned temporary directory (port of `@oh-my-pi/pi-utils` `TempDir`). A
+ * Owned temporary directory. A
  * `"@name-"` prefix creates it under the OS temp dir.
  */
 export class TempDir {

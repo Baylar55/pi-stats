@@ -1,6 +1,6 @@
 /**
- * Project-folder normalization (from omp's `gain-aggregator.ts`): worktree
- * sub-paths collapse to their project root and temp locations are recognized.
+ * Project-folder normalization: worktree sub-paths collapse to their project
+ * root and temp locations are recognized.
  * Paths are compared and stored with forward slashes, so `C:\Users\me\app`
  * and `C:/Users/me/app` are one project.
  */

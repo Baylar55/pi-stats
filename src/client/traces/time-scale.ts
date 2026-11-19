@@ -172,7 +172,7 @@ export function buildScale(tracks: TraceTrack[], mode: AxisMode, compressIdle: b
 		const anchors: number[] = [];
 		for (const track of tracks) {
 			for (const span of track.spans) {
-				if (span.kind === "model" || span.kind === "tool" || span.kind === "background") {
+				if (span.kind === "model" || span.kind === "tool") {
 					anchors.push(span.start, span.end);
 				}
 			}

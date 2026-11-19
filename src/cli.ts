@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 /**
- * `pi-stats`: the standalone dashboard / report bin. Port of omp's
- * `omp stats` (`cli/stats-cli.ts`) and `omp-stats` entry points.
+ * `pi-stats`: the standalone dashboard / report bin.
  */
 import { styleText } from "node:util";
 import {

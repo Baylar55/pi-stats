@@ -204,7 +204,7 @@ function unionLength(intervals: Array<[number, number]>): number {
 /**
  * Usage pricing against the open database's rate card, matching ingest
  * (`resolveStoredCost`), so a trace's headline agrees with Costs and Requests.
- * Without a database (offline snapshots) only recorded costs count.
+ * Without a database only recorded costs count.
  */
 function createUsagePricer(): UsagePricer {
 	const database = currentDb();
@@ -282,7 +282,6 @@ function scanTranscript(
 	file: string,
 	timings: ReadonlyMap<string, RequestTiming>,
 	price: UsagePricer,
-	header?: TraceSnapshotHeader | null,
 ): TrackScan {
 	// Boundary cast: persisted JSONL entries are re-validated field-by-field below.
 	const views = entries as readonly EntryView[];
@@ -293,9 +292,9 @@ function scanTranscript(
 	const toolResults = new Map<string, { start?: number; end: number; isError: boolean; entryId?: string }>();
 	const turns: Array<{ time: number; label: string; entryId?: string }> = [];
 
-	let cwd = typeof header?.cwd === "string" ? header.cwd : null;
-	let headerTs = toMs(header?.timestamp);
-	let sessionName: string | null = typeof header?.title === "string" ? header.title : null;
+	let cwd: string | null = null;
+	let headerTs: number | undefined;
+	let sessionName: string | null = null;
 	let firstAssistantModel: string | null = null;
 	let currentProvider = "unknown";
 	let currentModel = "unknown";
@@ -498,7 +497,6 @@ function scanTranscript(
 			id: trackId,
 			parentId: parentTrackId,
 			label: "",
-			agent: null,
 			model: firstAssistantModel,
 			file,
 			spans,
@@ -713,11 +711,6 @@ export async function traceFingerprintForEtag(fileParam: string): Promise<TraceF
 	}
 }
 
-export function traceMemoForTests(): { file: string; mtimeMs: number } | undefined {
-	if (!traceMemo) return undefined;
-	return { file: traceMemo.file, mtimeMs: traceMemo.entry.mtimeMs };
-}
-
 /**
  * Assemble the full span tree for one root session transcript.
  * Throws {@link TracePathError} for paths outside the session roots; ENOENT
@@ -781,77 +774,7 @@ export async function buildSessionTrace(fileParam: string, fingerprint?: TraceFi
 	return trace;
 }
 
-/** Header metadata used by snapshot traces. */
-export interface TraceSnapshotHeader {
-	timestamp?: string;
-	cwd?: string;
-	title?: string;
-}
-
-/** The entries of one embedded transcript; its header may be stored separately. */
-export interface SessionTraceSnapshot {
-	header?: TraceSnapshotHeader | null;
-	entries: readonly SessionEntry[];
-	/** Live timings by entry id, when the caller has them. */
-	timings?: ReadonlyMap<string, RequestTiming>;
-}
-
-/** A collected child transcript, keyed by its slash-joined path from the root. */
-export interface SubSessionTraceSnapshot extends SessionTraceSnapshot {
-	parent: string | null;
-}
-
-const NO_TIMINGS: ReadonlyMap<string, RequestTiming> = new Map();
-
-/**
- * Assemble an offline trace using the same timing joins and rollups as the live
- * filesystem builder. Only supplied snapshots participate: no filesystem,
- * network, or wall-clock reads; the rate card is consulted only when a
- * database is already open. Track files are snapshot keys, never disk paths.
- *
- * Missing parent transcripts attach their readable descendants to main. Unlike
- * filesystem discovery, already-collected snapshots need no depth limit.
- * `mtimeMs` is the root's last activity (or header time, then 0); the constant
- * `etag` identifies a snapshot, not a conditional HTTP response.
- */
-export function buildSessionTraceFromSnapshots(
-	root: SessionTraceSnapshot,
-	subSessions?: Readonly<Record<string, SubSessionTraceSnapshot>>,
-): SessionTrace {
-	const children = new Map<string | null, Array<[string, SubSessionTraceSnapshot]>>();
-	if (subSessions) {
-		for (const key of Object.keys(subSessions).sort()) {
-			const snapshot = subSessions[key];
-			const parent =
-				snapshot.parent !== null && Object.hasOwn(subSessions, snapshot.parent) ? snapshot.parent : null;
-			const siblings = children.get(parent);
-			if (siblings) siblings.push([key, snapshot]);
-			else children.set(parent, [[key, snapshot]]);
-		}
-	}
-
-	const price = createUsagePricer();
-	const tracks: TraceTrack[] = [];
-	const scans: TrackScan[] = [];
-	const visit = (snapshot: SessionTraceSnapshot, key: string, parentId: string | null): TrackScan => {
-		const scan = scanTranscript(snapshot.entries, key, parentId, key, snapshot.timings ?? NO_TIMINGS, price, snapshot.header);
-		tracks.push(scan.track);
-		scans.push(scan);
-		const linked = new Map<string, TrackScan>();
-		for (const [childKey, childSnapshot] of children.get(parentId === null ? null : key) ?? []) {
-			const child = visit(childSnapshot, childKey, key);
-			const stem = childKey.slice(childKey.lastIndexOf("/") + 1);
-			child.track.label = headText(`agent ${stem}`, LABEL_MAX);
-			linked.set(stem, child);
-		}
-		linkChildTracks(scan, linked);
-		return scan;
-	};
-	const rootScan = visit(root, "main", null);
-	return assembleSessionTrace(rootScan, tracks, scans, rootScan.lastActivity ?? rootScan.headerTs ?? 0, "snapshot");
-}
-
-/** Shared aggregation after either filesystem discovery or snapshot traversal. */
+/** Shared aggregation after filesystem discovery. */
 function assembleSessionTrace(
 	rootScan: TrackScan,
 	tracks: TraceTrack[],

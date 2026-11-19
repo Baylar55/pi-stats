@@ -1,6 +1,5 @@
 /**
- * Open the dashboard in the system browser. omp shows it in a Tern pane; pi
- * has none, so this is the only launcher. Over SSH or on a headless machine
+ * Open the dashboard in the system browser. Over SSH or on a headless machine
  * nothing is opened and the caller prints the URL.
  */
 import { spawn } from "node:child_process";

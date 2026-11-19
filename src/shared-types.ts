@@ -1,7 +1,7 @@
 /**
  * Shared type definitions consumed by both the server-side stats code and the
  * standalone client bundle. Keep this file free of any imports from server-only
- * packages (e.g. `@oh-my-pi/pi-ai`, `bun:sqlite`) so the client can import it
+ * packages (e.g. `pi-ai`, `bun:sqlite`) so the client can import it
  * without dragging server dependencies into its bundle.
  */
 
@@ -36,8 +36,6 @@ export interface AggregatedStats {
 	totalCost: number;
 	/** Requests with token usage but no public-equivalent subscription price. */
 	unpricedRequests: number;
-	/** Total premium requests */
-	totalPremiumRequests: number;
 	/** Average duration in ms */
 	avgDuration: number | null;
 	/** Average TTFT in ms */
@@ -133,21 +131,6 @@ export interface CostTimeSeriesPoint {
 	costCacheWrite: number;
 	/** Request count */
 	requests: number;
-}
-
-/**
- * One local calendar day of aggregate request activity, for the `/usage`
- * activity heatmap in the coding-agent TUI.
- */
-export interface DailyActivityPoint {
-	/** Local calendar date, `YYYY-MM-DD`. */
-	day: string;
-	/** Summed API-equivalent cost for the day. */
-	cost: number;
-	/** Request count for the day. */
-	requests: number;
-	/** Total tokens (input + output + cache) for the day. */
-	totalTokens: number;
 }
 
 /**
@@ -263,7 +246,7 @@ export interface FrustrationDashboardStats {
 	overall: FrustrationCounts;
 	/** Every model with messages in range, ordered by class, then revision, then family. */
 	byModel: FrustrationModelStats[];
-	/** Whether this dashboard host can run the judge (standalone `omp-stats` cannot). */
+	/** Whether this dashboard host can run the judge (the standalone `pi-stats` bin cannot). */
 	judgeAvailable: boolean;
 	job: FrustrationJobStatus;
 }
@@ -359,7 +342,6 @@ export interface ProviderAggregate {
 	totalCost: number;
 	/** Requests excluded because no public-equivalent subscription price exists. */
 	unpricedRequests: number;
-	totalPremiumRequests: number;
 	avgTokensPerSecond: number | null;
 }
 
@@ -423,7 +405,7 @@ export interface ProviderDashboardStats {
 
 /**
  * One row of the Traces session list: a root session with every child
- * transcript (task subagents, advisors) folded in.
+ * transcript (task subagents) folded in.
  */
 export interface SessionSummary {
 	/** Absolute root session file path (trace key). */
@@ -442,12 +424,12 @@ export interface SessionSummary {
 	subagents: number;
 	totalTokens: number;
 	costTotal: number;
-	/** Requests whose zero cost is unknown spend (scheduled card, no timestamp). */
+	/** Requests whose zero cost is unknown spend, not free usage. */
 	unpricedRequests: number;
 	models: string[];
 }
 
-export type TraceSpanKind = "turn" | "model" | "tool" | "subagent" | "background";
+export type TraceSpanKind = "turn" | "model" | "tool" | "subagent";
 
 /** One rendered block on a trace track lane. */
 export interface TraceSpan {
@@ -483,22 +465,20 @@ export interface TraceSpan {
 export interface TraceMarker {
 	/** ms epoch. */
 	time: number;
-	kind: "compaction" | "model_change" | "mode_change" | "reset" | "session_exit";
-	/** e.g. "compaction 142k→38k", model id, mode name, exit kind. */
+	kind: "compaction" | "model_change";
+	/** e.g. "compaction 142k→38k", model id. */
 	label: string;
 }
 
-/** One transcript (main session, subagent, advisor) in a trace. */
+/** One transcript (main session or subagent) in a trace. */
 export interface TraceTrack {
-	/** "main" or slash-joined child key: "Scout1", "Scout1/Nested2", "__advisor". */
+	/** "main" or slash-joined child key: "Scout1", "Scout1/Nested2". */
 	id: string;
 	parentId: string | null;
 	label: string;
-	/** session_init.agent when recorded. */
-	agent: string | null;
 	/** session_init.resolvedModel ?? first assistant model. */
 	model: string | null;
-	/** Absolute transcript path for live entry fetch, or the embedded snapshot key. */
+	/** Absolute transcript path for live entry fetch. */
 	file: string;
 	/** Sorted by start. */
 	spans: TraceSpan[];
@@ -542,14 +522,13 @@ export interface SessionTrace {
 	cwd: string | null;
 	startedAt: number;
 	endedAt: number;
-	/** Root transcript mtime, or recorded root activity/header time for offline snapshots. */
+	/** Root transcript mtime. */
 	mtimeMs: number;
 	/**
 	 * Conditional-request fingerprint `"<rootMs>:<rootSize>:<digest>"` (see
 	 * traceFingerprintForEtag): the digest folds the child-transcript set into a
 	 * fixed-size key, so a subagent-only append changes the ETag even when the
 	 * root is untouched without making `If-None-Match` unbounded.
-	 * Offline snapshots use "snapshot" and do not support HTTP revalidation.
 	 */
 	etag: string;
 	/** DFS order, main first. */

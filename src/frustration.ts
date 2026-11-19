@@ -56,9 +56,9 @@ export interface StatsJudge {
 /** Lazily resolves the host judge on first estimate/run so starting the dashboard stays fast. */
 export type StatsJudgeProvider = () => Promise<StatsJudge>;
 
-/** Per-request input-token overhead of the rubric prompt, measured by omp on jev-1.13. */
+/** Per-request input-token overhead of the rubric prompt (measured). */
 const REQUEST_OVERHEAD_TOKENS = 561;
-/** Prose characters per input token, measured by omp on jev-1.13. */
+/** Prose characters per input token (measured). */
 const CHARS_PER_TOKEN = 5.9;
 /** Output tokens a prompted chat judge bills per request. */
 const OUTPUT_TOKENS_PER_REQUEST = 8;
@@ -134,8 +134,7 @@ export function getFrustrationJobStatus(): FrustrationJobStatus {
 
 /**
  * Shape per-(model, provider) rows for the dashboard, sorted by first use.
- * omp merges provider and spelling variants by its catalog's
- * `class/family/revision` identity; pi has no such catalog, so the provider
+ * pi has no catalog identity to merge spelling variants by, so the provider
  * is the class the page filters by and each model is its own family.
  */
 export function mergeFrustrationRows(rows: readonly FrustrationModelRow[]): FrustrationModelStats[] {

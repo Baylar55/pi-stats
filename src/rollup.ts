@@ -8,7 +8,7 @@
  * thousand rows.
  *
  * Freshness is trigger-driven: any INSERT/UPDATE/DELETE on the raw tables — from
- * this process, a sync worker, or another omp process sharing the database —
+ * this process, a sync worker, or another process sharing the database —
  * records the touched hour in `rollup_dirty`. {@link refreshRollups} recomputes
  * dirty hours newest-first in short immediate transactions.
  *
@@ -33,7 +33,6 @@ import type {
 	AgentTypeStats,
 	AggregatedStats,
 	CostTimeSeriesPoint,
-	DailyActivityPoint,
 	FolderStats,
 	ModelPerformancePoint,
 	ModelStats,
@@ -54,7 +53,7 @@ const DAY_MS = 24 * HOUR_MS;
  * Bump when the rollup schema or fact definitions change: the tables are then
  * dropped and every hour is rebuilt from the raw tables.
  */
-const ROLLUP_VERSION = "2";
+const ROLLUP_VERSION = "3";
 const ROLLUP_VERSION_KEY = "rollup_version";
 /** Bump when the dirty-marking triggers change; they are then recreated in place. */
 const TRIGGER_VERSION = "4";
@@ -94,7 +93,6 @@ function messageFacts(bucketExpr: string, p: string): string {
 		SUM(${p}cache_read_tokens) AS cache_read_tokens,
 		SUM(${p}cache_write_tokens) AS cache_write_tokens,
 		SUM(${p}total_tokens) AS total_tokens,
-		TOTAL(${p}premium_requests) AS premium_requests,
 		TOTAL(${p}cost_total) AS cost_total,
 		TOTAL(${p}cost_input) AS cost_input,
 		TOTAL(${p}cost_output) AS cost_output,
@@ -115,7 +113,7 @@ function messageFacts(bucketExpr: string, p: string): string {
 }
 
 const MESSAGE_ROLLUP_COLUMNS = `bucket, ${MESSAGE_DIMENSIONS}, requests, failed, input_tokens, output_tokens,
-	cache_read_tokens, cache_write_tokens, total_tokens, premium_requests, cost_total, cost_input, cost_output,
+	cache_read_tokens, cache_write_tokens, total_tokens, cost_total, cost_input, cost_output,
 	cost_cache_read, cost_cache_write, unpriced, cached_prompt_cost, no_cache_input_cost, duration_sum, duration_n,
 	ttft_sum, ttft_n, tps_sum, tps_n, first_ts, last_ts`;
 
@@ -205,7 +203,7 @@ export function ensureRollupSchema(database: Database): void {
 	const fresh = readMeta(ROLLUP_VERSION_KEY) !== ROLLUP_VERSION;
 	const toolAgentFresh = fresh || readMeta(TOOL_AGENT_VERSION_KEY) !== TOOL_AGENT_VERSION;
 	// Steady state touches no schema: DDL on every open would contend with
-	// other omp processes writing the same database.
+	// other processes writing the same database.
 	if (!fresh && !toolAgentFresh && readMeta(TRIGGER_VERSION_KEY) === TRIGGER_VERSION) return;
 	database
 		.transaction(() => {
@@ -234,7 +232,6 @@ export function ensureRollupSchema(database: Database): void {
 				cache_read_tokens INTEGER NOT NULL,
 				cache_write_tokens INTEGER NOT NULL,
 				total_tokens INTEGER NOT NULL,
-				premium_requests REAL NOT NULL,
 				cost_total REAL NOT NULL,
 				cost_input REAL NOT NULL,
 				cost_output REAL NOT NULL,
@@ -635,7 +632,6 @@ const AGGREGATE_COLUMNS = `
 	SUM(f.output_tokens) AS output_tokens,
 	SUM(f.cache_read_tokens) AS cache_read_tokens,
 	SUM(f.cache_write_tokens) AS cache_write_tokens,
-	TOTAL(f.premium_requests) AS premium_requests,
 	TOTAL(f.cost_total) AS cost_total,
 	SUM(f.unpriced) AS unpriced,
 	TOTAL(f.cached_prompt_cost) AS cached_prompt_cost,
@@ -653,7 +649,6 @@ interface AggregateRow {
 	output_tokens: number | null;
 	cache_read_tokens: number | null;
 	cache_write_tokens: number | null;
-	premium_requests: number | null;
 	cost_total: number | null;
 	unpriced: number | null;
 	cached_prompt_cost: number | null;
@@ -688,7 +683,6 @@ function toAggregatedStats(row: AggregateRow | undefined): AggregatedStats {
 		cacheSavings: noCacheInputCost > 0 ? (noCacheInputCost - cachedPromptCost) / noCacheInputCost : 0,
 		totalCost: row?.cost_total ?? 0,
 		unpricedRequests: row?.unpriced ?? 0,
-		totalPremiumRequests: row?.premium_requests ?? 0,
 		avgDuration: row?.avg_duration ?? null,
 		avgTtft: row?.avg_ttft ?? null,
 		avgTokensPerSecond: row?.avg_tps ?? null,
@@ -849,14 +843,13 @@ export function getStatsByProvider(cutoff: number | null = null): ProviderAggreg
 		cache_write_tokens: number;
 		cost_total: number;
 		unpriced: number;
-		premium_requests: number;
 		avg_tps: number | null;
 	}>(
 		{ cutoff },
 		`f.provider AS provider, SUM(f.requests) AS requests, SUM(f.failed) AS failed,
 		 COUNT(DISTINCT f.model) AS models, SUM(f.input_tokens) AS input_tokens, SUM(f.output_tokens) AS output_tokens,
 		 SUM(f.cache_read_tokens) AS cache_read_tokens, SUM(f.cache_write_tokens) AS cache_write_tokens,
-		 TOTAL(f.cost_total) AS cost_total, SUM(f.unpriced) AS unpriced, TOTAL(f.premium_requests) AS premium_requests,
+		 TOTAL(f.cost_total) AS cost_total, SUM(f.unpriced) AS unpriced,
 		 TOTAL(f.tps_sum) / NULLIF(SUM(f.tps_n), 0) AS avg_tps`,
 		"GROUP BY f.provider",
 	)
@@ -872,7 +865,6 @@ export function getStatsByProvider(cutoff: number | null = null): ProviderAggreg
 			totalTokens: row.input_tokens + row.output_tokens + row.cache_read_tokens + row.cache_write_tokens,
 			totalCost: row.cost_total,
 			unpricedRequests: row.unpriced,
-			totalPremiumRequests: row.premium_requests,
 			avgTokensPerSecond: row.avg_tps,
 		}))
 		.sort((a, b) => b.totalTokens - a.totalTokens);
@@ -904,25 +896,6 @@ export function getProviderHourlyBurn(cutoff: number | null = null): ProviderHou
 		outputTokens: row.output_tokens,
 		requests: row.requests,
 	}));
-}
-
-/**
- * Per-local-day request/token/cost totals since `cutoff`, oldest first, read
- * from the hourly rollup. Returns null when the local UTC offset is not a whole
- * hour (now or at `cutoff`), since hourly buckets then straddle local midnight,
- * or while the dirty backlog is too large for exact reads; callers then
- * aggregate the raw rows instead.
- */
-export function getDailyActivityFromRollup(cutoff: number): DailyActivityPoint[] | null {
-	if (new Date().getTimezoneOffset() % 60 !== 0 || new Date(cutoff).getTimezoneOffset() % 60 !== 0) return null;
-	const database = currentDb();
-	if (!database || !dirtyIsSmall(database)) return null;
-	return queryMessages<{ day: string; cost: number; requests: number; total_tokens: number | null }>(
-		{ cutoff },
-		`date(f.bucket / 1000, 'unixepoch', 'localtime') AS day, TOTAL(f.cost_total) AS cost,
-		 SUM(f.requests) AS requests, SUM(f.total_tokens) AS total_tokens`,
-		"GROUP BY day ORDER BY day",
-	).map(row => ({ day: row.day, cost: row.cost, requests: row.requests, totalTokens: row.total_tokens ?? 0 }));
 }
 
 /** Tokens/cost per bucket per provider. */

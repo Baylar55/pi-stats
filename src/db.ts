@@ -4,11 +4,10 @@ import { ChunkedInsert } from "./chunked-insert";
 import { getStatsDbPath } from "./config";
 import type { ParseSessionResult, SessionParserState } from "./parser";
 import { createRateLookup, type EstimatedCost, estimateCost, type ModelRates, type UsageCost, uncachedInputCost } from "./pricing";
-import { ensureRollupSchema, getDailyActivityFromRollup } from "./rollup";
+import { ensureRollupSchema } from "./rollup";
 import { Database } from "./sqlite";
 import type {
 	AgentType,
-	DailyActivityPoint,
 	FrustrationCounts,
 	MessageStats,
 	MessageStatsInput,
@@ -69,8 +68,8 @@ export async function initDb(): Promise<Database> {
 	if (db) return db;
 
 	db = new Database(getStatsDbPath());
-	// Install the busy handler BEFORE any lock-taking statement. See
-	// https://github.com/can1357/oh-my-pi/issues/2421.
+	// Install the busy handler BEFORE any lock-taking statement, so concurrent
+	// openers wait instead of failing with SQLITE_BUSY.
 	db.run("PRAGMA busy_timeout = 5000");
 	db.run("PRAGMA journal_mode = WAL");
 	// The database is a derived cache of the transcripts, so WAL's NORMAL sync
@@ -109,7 +108,6 @@ export async function initDb(): Promise<Database> {
 			cache_read_tokens INTEGER NOT NULL,
 			cache_write_tokens INTEGER NOT NULL,
 			total_tokens INTEGER NOT NULL,
-			premium_requests REAL NOT NULL DEFAULT 0,
 			cost_input REAL NOT NULL,
 			cost_output REAL NOT NULL,
 			cost_cache_read REAL NOT NULL,
@@ -118,7 +116,6 @@ export async function initDb(): Promise<Database> {
 			cost_no_cache_input REAL,
 			cost_unpriced INTEGER NOT NULL DEFAULT 0,
 			agent_type TEXT NOT NULL DEFAULT 'main',
-			service_tier TEXT,
 			-- The cost columns come from the rate card (1) or the transcript (0); only the former are re-priced.
 			cost_estimated INTEGER NOT NULL DEFAULT 0,
 			-- 1-hour subset of cache_write_tokens, billed at its own rate.
@@ -820,44 +817,6 @@ export function getMessageById(id: number): MessageStats | null {
 	const stmt = db.query<MessageRow>("SELECT * FROM messages WHERE id = ?");
 	const row = stmt.get(id);
 	return row ? rowToMessageStats(row) : null;
-}
-
-/**
- * Per-local-day activity aggregates for the last `days` days, oldest first.
- * Self-initializing (opens the stats DB on first use) so a caller can query
- * without the dashboard server's init flow. Days use the machine's
- * timezone — this is a localhost tool, same rationale as
- * {@link getProviderHourlyBurn}. Reads the hourly rollup, falling back to the
- * raw rows while its rebuild backlog is too large for exact reads.
- */
-export async function getDailyActivity(days = 371): Promise<DailyActivityPoint[]> {
-	const database = await initDb();
-	const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
-	const rolled = getDailyActivityFromRollup(cutoff);
-	if (rolled) return rolled;
-	const stmt = database.query(`
-		SELECT
-			date(timestamp / 1000, 'unixepoch', 'localtime') as day,
-			SUM(cost_total) as cost,
-			COUNT(*) as requests,
-			SUM(total_tokens) as total_tokens
-		FROM messages
-		WHERE timestamp >= ?
-		GROUP BY day
-		ORDER BY day ASC
-	`);
-	const rows = stmt.all(cutoff) as Array<{
-		day: string;
-		cost: number | null;
-		requests: number;
-		total_tokens: number | null;
-	}>;
-	return rows.map(row => ({
-		day: row.day,
-		cost: row.cost ?? 0,
-		requests: row.requests,
-		totalTokens: row.total_tokens ?? 0,
-	}));
 }
 
 /**

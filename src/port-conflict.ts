@@ -191,9 +191,8 @@ async function findPortHolder(port: number): Promise<PortHolder | null> {
 
 /**
  * Name the process left holding `port` in the log. The holder is never
- * stopped: omp upgrades an older dashboard by killing its process, but a
- * pi-stats dashboard lives inside the pi process that launched it (image
- * `node`), so killing the holder would end someone's agent session.
+ * stopped: a pi-stats dashboard lives inside the pi process that launched it
+ * (image `node`), so killing the holder would end someone's agent session.
  */
 function reportPortHolder(port: number, probe: StatsDashboardProbe): void {
 	findPortHolder(port).then(

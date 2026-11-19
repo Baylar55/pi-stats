@@ -13,7 +13,7 @@ import type { SessionTrace, TraceSpan, TraceSpanKind, TraceTrack } from "../type
 import { Card, ChartSkeleton, PageHeader, QueryView, SearchInput, Segmented } from "../ui";
 import { AggregatesPanel } from "./AggregatesPanel";
 import { Minimap } from "./Minimap";
-import { SpanDrawer, type TraceEntryLoader } from "./SpanDrawer";
+import { SpanDrawer } from "./SpanDrawer";
 import { SummaryStrip } from "./SummaryStrip";
 import { TimelineCanvas, type TimelineViewport } from "./TimelineCanvas";
 import { TranscriptList } from "./TranscriptList";
@@ -37,7 +37,6 @@ const LEGEND: Array<{ kind: TraceSpanKind; label: string }> = [
 	{ kind: "model", label: "Model" },
 	{ kind: "tool", label: "Tool" },
 	{ kind: "subagent", label: "Agent" },
-	{ kind: "background", label: "Background" },
 ];
 
 export function TraceView({ file, active, onBack }: TraceViewProps) {
@@ -81,24 +80,8 @@ export function TraceView({ file, active, onBack }: TraceViewProps) {
 	);
 }
 
-/** Data and host integration supplied to the shared live/offline trace viewer. */
-export interface SessionTraceViewProps {
-	trace: SessionTrace;
-	view?: "timeline" | "full";
-	loadEntry?: TraceEntryLoader;
-	/** Embedded viewers keep details inside their own layout, without a modal. */
-	embedded?: boolean;
-	onNavigate?: (trackId: string, entryId: string) => void;
-}
-
-/** Data-driven viewer shared by the live route and self-contained HTML exports. */
-export function SessionTraceView({
-	trace,
-	view = "full",
-	loadEntry,
-	embedded = false,
-	onNavigate,
-}: SessionTraceViewProps) {
+/** Data-driven viewer for one loaded session trace. */
+function SessionTraceView({ trace }: { trace: SessionTrace }) {
 	const [mode, setMode] = useState<AxisMode>("time");
 	const [compressIdle, setCompressIdle] = useState(true);
 	const [selection, setSelection] = useState<string | null>(null);
@@ -158,10 +141,10 @@ export function SessionTraceView({
 		return spans;
 	}, [tracks]);
 
-	// As with the lanes: the core kinds always, agents and background only when the trace has them.
+	// As with the lanes: the core kinds always, agents only when the trace has them.
 	const legend = useMemo(() => {
 		const present = new Set(allSpans.map(({ span }) => span.kind));
-		return LEGEND.filter(item => item.kind === "turn" || item.kind === "model" || item.kind === "tool" || present.has(item.kind));
+		return LEGEND.filter(item => item.kind !== "subagent" || present.has(item.kind));
 	}, [allSpans]);
 
 	const matches = useMemo(() => {
@@ -279,9 +262,9 @@ export function SessionTraceView({
 	const traceStart = trace.startedAt;
 
 	return (
-		<div className="stack traces-view" data-view={view}>
-			{view === "full" && <SummaryStrip summary={trace.summary} />}
-			{view === "full" && <p className="micro dim">{TIMING_NOTE}</p>}
+		<div className="stack traces-view">
+			<SummaryStrip summary={trace.summary} />
+			<p className="micro dim">{TIMING_NOTE}</p>
 			{allSpans.length === 0 && <p className="muted">No spans recorded in this session.</p>}
 
 			<Card
@@ -390,7 +373,6 @@ export function SessionTraceView({
 						collapsed={collapsed}
 						onToggleCollapse={toggleCollapse}
 						traceStart={traceStart}
-						autoFocus={!embedded}
 					/>
 				</div>
 			</Card>
@@ -400,24 +382,19 @@ export function SessionTraceView({
 				track={selected?.track ?? null}
 				onClose={closeDrawer}
 				onOpenChildTrack={openChildTrack}
-				loadEntry={loadEntry}
-				inline={embedded}
-				onNavigate={onNavigate}
 			/>
 
-			{view === "full" && (
-				<Card index={2} title="Transcript" description="Every span and marker in order; click to inspect" flush>
-					<TranscriptList
-						tracks={tracks}
-						selection={selection}
-						onSelect={openFromTranscript}
-						search={search}
-						matchIds={matchIds}
-						traceStart={traceStart}
-					/>
-				</Card>
-			)}
-			{view === "full" && <AggregatesPanel toolStats={trace.summary.toolStats} index={3} />}
+			<Card index={2} title="Transcript" description="Every span and marker in order; click to inspect" flush>
+				<TranscriptList
+					tracks={tracks}
+					selection={selection}
+					onSelect={openFromTranscript}
+					search={search}
+					matchIds={matchIds}
+					traceStart={traceStart}
+				/>
+			</Card>
+			<AggregatesPanel toolStats={trace.summary.toolStats} index={3} />
 		</div>
 	);
 }

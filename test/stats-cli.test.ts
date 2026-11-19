@@ -47,7 +47,7 @@ describe("/stats arguments", () => {
 		expect(parseStatsDashboardArgs("--port=4001 --host ::1")).toEqual({ port: 4001, host: "::1" });
 	});
 
-	it("reports omp's exact usage and error strings", () => {
+	it("reports the exact usage and error strings", () => {
 		const usage = "Usage: /stats [--port <port>] [--host <host>]";
 		expect(parseStatsDashboardArgs("--port")).toEqual({ error: `Missing port. ${usage}` });
 		expect(parseStatsDashboardArgs("--port=99999")).toEqual({ error: "Invalid port: 99999" });

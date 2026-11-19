@@ -36,7 +36,7 @@ declare global {
 
 const state: ProcessState = (globalThis.__piStats ??= {});
 
-/** Output budget of one judge reply: room for a thinking preamble before the label (omp's `JUDGMENT_CHAT_MAX_TOKENS`). */
+/** Output budget of one judge reply: room for a thinking preamble before the label. */
 const JUDGE_MAX_TOKENS = 4096;
 
 /** Stream events that carry model output; the first one marks the first token. */
@@ -153,7 +153,7 @@ async function publishPrices(runtime: typeof Runtime, ctx: ExtensionContext): Pr
 /**
  * Start (or reuse) the dashboard and open it, without waiting for ingest: the
  * server syncs sessions in the background and streams progress to the page.
- * Port of omp's `launchStatsDashboard`; the messages are verbatim.
+ * Messages go to the TUI as notifications, or to stdout without a UI.
  */
 async function launchStatsDashboard(args: StatsDashboardArgs, ctx: ExtensionCommandContext): Promise<void> {
 	const runtime = await loadRuntime();

@@ -69,7 +69,3 @@ export const NAV: readonly NavGroup[] = [
 export const NAV_ITEMS: readonly NavItem[] = NAV.flatMap(group => group.items);
 
 export const SECTIONS: readonly DashboardSection[] = NAV_ITEMS.map(item => item.id);
-
-export function navItem(section: DashboardSection): NavItem {
-	return NAV_ITEMS.find(item => item.id === section) ?? NAV_ITEMS[0];
-}

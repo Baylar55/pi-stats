@@ -18,7 +18,6 @@ function track(id: string, spans: TraceSpan[]): TraceTrack {
 		id,
 		parentId: id === "main" ? null : "main",
 		label: id,
-		agent: null,
 		model: null,
 		file: id,
 		spans,

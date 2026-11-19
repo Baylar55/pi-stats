@@ -1,6 +1,5 @@
 /**
- * `/stats` argument handling. `parseStatsDashboardArgs` and its messages are
- * verbatim from omp's `slash-commands/helpers/stats-dashboard.ts`.
+ * `/stats` argument handling and completion.
  */
 
 export const DEFAULT_STATS_DASHBOARD_PORT = 3847;

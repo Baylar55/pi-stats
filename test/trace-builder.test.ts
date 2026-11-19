@@ -15,12 +15,10 @@ import { setModelPrices } from "../src/pricing";
 import { getOverallStats } from "../src/rollup";
 import {
 	buildSessionTrace,
-	buildSessionTraceFromSnapshots,
 	getTraceEntry,
 	listSessionSummaries,
 	TracePathError,
 } from "../src/trace";
-import type { SessionEntry } from "../src/types";
 import { assistant, header, sessionPath, toolCall, toolResult, usage, user, writeSession } from "./helpers/session";
 import { installStatsTestIsolation } from "./helpers/temp-agent";
 
@@ -207,60 +205,6 @@ describe("buildSessionTrace", () => {
 
 	it("reports a missing transcript inside a root as not found, not as a path error", async () => {
 		await expect(buildSessionTrace(sessionPath("missing.jsonl"))).rejects.toMatchObject({ code: "ENOENT" });
-	});
-});
-
-describe("buildSessionTraceFromSnapshots", () => {
-	it("matches the filesystem builder without exposing transcript paths", async () => {
-		const rootFile = await writeFixture();
-		const child = [header("/tmp/proj"), user("cu", "scout this", { timestamp: T + 6_000 }), reply("ca", "cu", T + 6_100, T + 7_000)];
-		await writeSession(path.join(rootFile.slice(0, -".jsonl".length), "Scout1.jsonl"), child);
-
-		const live = await buildSessionTrace(rootFile);
-		const snapshot = buildSessionTraceFromSnapshots(
-			{ entries: ROOT_ENTRIES as SessionEntry[] },
-			{ Scout1: { entries: child as SessionEntry[], parent: null } },
-		);
-
-		expect(snapshot).toEqual({
-			...live,
-			file: "main",
-			mtimeMs: snapshot.mtimeMs,
-			etag: "snapshot",
-			tracks: live.tracks.map(track => ({ ...track, file: track.id })),
-		});
-		expect(JSON.stringify(snapshot)).not.toContain(rootFile);
-	});
-
-	it("preserves separate headers and bounds spanless snapshots deterministically", () => {
-		const snapshot = buildSessionTraceFromSnapshots({
-			header: { timestamp: iso(T), cwd: "/tmp/proj", title: "Header title" },
-			entries: [],
-		});
-		expect(snapshot).toMatchObject({
-			file: "main",
-			title: "Header title",
-			cwd: "/tmp/proj",
-			startedAt: T,
-			endedAt: T,
-			mtimeMs: T,
-			summary: { wallMs: 0, requests: 0, subagents: 0 },
-		});
-		expect(buildSessionTraceFromSnapshots({ entries: [] })).toMatchObject({ startedAt: 0, endedAt: 0, mtimeMs: 0 });
-	});
-
-	it("retains partial descendants when their parent transcript was unreadable", () => {
-		const child = [user("cu", "scout", { timestamp: T + 6_000 }), reply("ca", "cu", T + 6_100, T + 7_000)];
-		const snapshot = buildSessionTraceFromSnapshots(
-			{ entries: [] },
-			{ "Missing/Child": { entries: child as SessionEntry[], parent: "Missing" } },
-		);
-		expect(snapshot.tracks.map(track => [track.id, track.parentId, track.file])).toEqual([
-			["main", null, "main"],
-			["Missing/Child", "main", "Missing/Child"],
-		]);
-		expect(snapshot.tracks[0].spans[0]).toMatchObject({ kind: "subagent", childTrackId: "Missing/Child", start: T + 6_000, end: T + 7_000 });
-		expect(snapshot.summary).toMatchObject({ requests: 1, subagents: 1, totalTokens: 100 });
 	});
 });
 

@@ -32,8 +32,6 @@ export interface TimelineCanvasProps {
 	collapsed: ReadonlySet<string>;
 	onToggleCollapse: (trackId: string) => void;
 	traceStart: number;
-	/** Live route focuses immediately; embedded viewers wait for user interaction. */
-	autoFocus?: boolean;
 }
 
 const RULER_H = 28;
@@ -55,7 +53,6 @@ const LANE_ORDER: Array<{ kind: TraceSpanKind; label: string }> = [
 	{ kind: "model", label: "Model" },
 	{ kind: "tool", label: "Tools" },
 	{ kind: "subagent", label: "Agents" },
-	{ kind: "background", label: "Bg" },
 ];
 
 interface LaneRow {
@@ -113,7 +110,6 @@ function buildLayout(tracks: TraceTrack[], collapsed: ReadonlySet<string>): Time
 			model: [],
 			tool: [],
 			subagent: [],
-			background: [],
 		};
 		for (const span of track.spans) byKind[span.kind].push(span);
 		const block: TrackBlock = {
@@ -224,7 +220,6 @@ export function TimelineCanvas({
 	collapsed,
 	onToggleCollapse,
 	traceStart,
-	autoFocus = true,
 }: TimelineCanvasProps) {
 	const colors = useTraceTheme();
 	const containerRef = useRef<HTMLDivElement>(null);
@@ -470,8 +465,8 @@ export function TimelineCanvas({
 	};
 
 	useEffect(() => {
-		if (autoFocus) canvasRef.current?.focus({ preventScroll: true });
-	}, [autoFocus]);
+		canvasRef.current?.focus({ preventScroll: true });
+	}, []);
 
 	// Scene: everything except hover/selection, so pointer moves never repaint it.
 	useEffect(() => {

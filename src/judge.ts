@@ -1,7 +1,6 @@
 /**
- * Prompted chat judge for the Frustration rubric: a host-free port of omp's
- * text judge (`packages/ai/src/judgment/text.ts` and its `text-judge*.md`
- * prompts) for the two questions in `prompts/judge/frustration.json`. The
+ * Prompted chat judge for the Frustration rubric: the two questions in
+ * `prompts/judge/frustration.json`, asked through any chat model. The
  * system prompt carries the question definitions (constant across texts, so
  * prompt caches hit); the user text carries the state and the answer cue.
  */
@@ -33,7 +32,7 @@ const LEVELS = questionFile.annoyed.criteria;
 const TARGET_CRITERIA: Record<FrustrationTarget, string> = questionFile.target.criteria;
 const TARGETS = Object.keys(TARGET_CRITERIA) as FrustrationTarget[];
 const QUESTION_IDS = ["annoyed", "target"] as const;
-/** Extra attempts when a reply does not parse (omp's chat backend `parseRetries`). */
+/** Extra attempts when a reply does not parse. */
 const PARSE_RETRIES = 2;
 
 const backticked = (labels: readonly (string | number)[]): string => labels.map(label => `\`${label}\``).join(", ");

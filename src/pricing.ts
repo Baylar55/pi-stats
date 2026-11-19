@@ -1,8 +1,8 @@
 /**
  * The rate card behind every API-equivalent cost estimate.
  *
- * omp prices usage from its bundled model catalog; pi-stats has no catalog of
- * its own. The extension hands over pi's model registry through
+ * pi-stats has no catalog of its own. The extension hands over pi's model
+ * registry through
  * {@link setModelPrices} and it is persisted in `model_prices`, so every
  * process sharing the database prices identically. The bin seeds pi-ai's
  * built-in catalog only into an empty table: it lacks `models.json` and
@@ -98,7 +98,7 @@ const PRICE_COLUMNS = "provider, model, input, output, cache_read, cache_write, 
  * OAuth provider lists its models at zero; that peer is the public API price
  * of the same model. Peers are tried in provider order so the choice is stable.
  * ponytail: when two providers list the same id at different prices (a reseller
- * markup), the alphabetically first wins; omp uses an explicit peer table.
+ * markup), the alphabetically first wins; an explicit peer table would fix that.
  */
 const FIND_PRICE_SQL = `
 	SELECT ${PRICE_COLUMNS} FROM model_prices
@@ -124,12 +124,6 @@ function samePrice(a: PriceRow | null, b: PriceRow | null): boolean {
 		a.cache_write === b.cache_write &&
 		a.tiers === b.tiers
 	);
-}
-
-/** Whether `provider/model` can be priced: it, or a pricing peer, has a non-zero price. False before `initDb`. */
-export function hasModelPrice(provider: string, model: string): boolean {
-	const database = currentDb();
-	return database !== null && findPriceRow(database, provider, model) !== null;
 }
 
 /** Whether any rate card is stored. False before `initDb`. */
