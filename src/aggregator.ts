@@ -136,7 +136,7 @@ function spawnWorker(workerPath: string): WorkerHandle {
 	// Workers start with a fresh module graph: hand them the directories this thread resolved.
 	const workerData: SyncWorkerData = { agentDir: getAgentDir(), sessionRoots: getSessionRoots() };
 	const worker = new Worker(workerPath, { workerData });
-	// A sync must never hold the host process (pi) open.
+	// An idle pool must never hold the host process (pi) open; a parse in flight does (see `dispatch`).
 	worker.unref();
 	const handle: WorkerHandle = { worker, busy: false, resolve: null, reject: null };
 	const settle = (): Pick<WorkerHandle, "resolve" | "reject"> => {
@@ -144,6 +144,7 @@ function spawnWorker(workerPath: string): WorkerHandle {
 		handle.resolve = null;
 		handle.reject = null;
 		handle.busy = false;
+		worker.unref();
 		return { resolve, reject };
 	};
 	worker.on("message", (data: SyncWorkerResponse) => {
@@ -165,6 +166,8 @@ function dispatch(handle: WorkerHandle, request: SyncWorkerRequest): Promise<Par
 	handle.busy = true;
 	handle.resolve = resolve;
 	handle.reject = reject;
+	// Without a ref, a runtime may exit while the only pending work is this reply (Bun does, from the bin).
+	handle.worker.ref();
 	handle.worker.postMessage(request);
 	return promise;
 }
