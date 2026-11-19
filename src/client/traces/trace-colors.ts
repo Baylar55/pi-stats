@@ -50,9 +50,9 @@ function readTheme(root: HTMLElement): TraceTheme {
 	return {
 		category: {
 			turn: v(CATEGORY_VARS.turn, "#a0a0a8"),
-			model: v(CATEGORY_VARS.model, "#5ad8e6"),
+			model: v(CATEGORY_VARS.model, "#4d9abf"),
 			tool: v(CATEGORY_VARS.tool, "#f5a524"),
-			subagent: v(CATEGORY_VARS.subagent, "#ed4abf"),
+			subagent: v(CATEGORY_VARS.subagent, "#f09082"),
 			background: v(CATEGORY_VARS.background, "#46464c"),
 		},
 		error: v("--bad", "#ff6166"),
@@ -62,7 +62,7 @@ function readTheme(root: HTMLElement): TraceTheme {
 		grid: v("--chart-grid", "rgba(255, 255, 255, 0.055)"),
 		tick: v("--chart-axis", "#5c5c64"),
 		spanText: v("--ink-inverse", "#0a0a0b"),
-		selection: v("--focus", "#5ad8e6"),
+		selection: v("--focus", "#4d9abf"),
 		brush: v("--selected", "rgba(255, 255, 255, 0.075)"),
 		fontSans: v("--font-sans", "system-ui, sans-serif"),
 		fontMono: v("--font-mono", "ui-monospace, monospace"),

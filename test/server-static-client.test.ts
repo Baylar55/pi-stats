@@ -63,7 +63,7 @@ describe("static client", () => {
 
 		expect((await raw("/index.js")).headers["content-type"]).toBe("text/javascript; charset=utf-8");
 		expect((await raw("/index.css")).headers["content-type"]).toBe("text/css; charset=utf-8");
-		expect((await raw("/favicon.ico")).headers["content-type"]).toBe("image/x-icon");
+		expect((await raw("/favicon.svg")).headers["content-type"]).toBe("image/svg+xml");
 	});
 
 	it("answers every other path with the app shell, never with a file from disk", async () => {

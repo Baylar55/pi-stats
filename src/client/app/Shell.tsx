@@ -58,15 +58,11 @@ export function Shell({ section, onSectionChange, range, onRangeChange, children
 					<Menu size={16} />
 				</button>
 				<div className="topbar-brand">
-					<svg className="topbar-mark" viewBox="0 0 64 64" width="22" height="22" aria-hidden="true">
-						<defs>
-							<linearGradient id="pi-stats-mark-grad" x1="0" y1="0" x2="1" y2="1">
-								<stop offset="0" stopColor="oklch(0.7 0.24 340)" />
-								<stop offset=".5" stopColor="oklch(0.62 0.21 295)" />
-								<stop offset="1" stopColor="oklch(0.81 0.14 200)" />
-							</linearGradient>
-						</defs>
-						<path fill="url(#pi-stats-mark-grad)" d="M10 14h44v9H43v33h-9V23h-9v22h-9V23H10z" />
+					{/* pi's logo mark (pi.dev), cropped to the mark. */}
+					<svg className="topbar-mark" viewBox="165 165 470 470" width="20" height="20" aria-hidden="true">
+						<path fill="#F09082" d="M165.29 165.29H517.36V400H400V282.65H165.29Z" />
+						<path fill="#4D9ABF" d="M165.29 282.65H282.65V400H400V517.36H282.65V634.72H165.29Z" />
+						<path fill="#F1BE58" d="M517.36 400H634.72V634.72H517.36Z" />
 					</svg>
 					<span>pi</span>
 					<span className="topbar-slash">/</span>

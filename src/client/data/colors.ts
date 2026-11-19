@@ -4,18 +4,18 @@
  * legible hues and the same key on the same hue across charts of one page.
  */
 
-/** Ten mid-luminance hues that read on both the black and the white chassis. */
+/** Ten mid-luminance hues that read on both the black and the white chassis; pi's logo colors lead. */
 export const SERIES_COLORS = [
-	"#5ad8e6", // cyan
-	"#ed4abf", // pink
+	"#4d9abf", // pi blue
+	"#f09082", // pi coral
+	"#f1be58", // pi yellow
 	"#9d7bff", // violet
-	"#f5b54a", // amber
 	"#4ade80", // green
-	"#5b8cff", // blue
-	"#ff7a59", // coral
+	"#5ad8e6", // cyan
+	"#e879f9", // fuchsia
 	"#2dd4bf", // teal
 	"#c3e94f", // lime
-	"#fb7185", // rose
+	"#5b8cff", // indigo
 ];
 
 /** Neutral used for "Other" rollups and unknown buckets. */

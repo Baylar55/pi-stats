@@ -65,7 +65,7 @@ const indexHtml = `<!DOCTYPE html>
       })();
     </script>
     <link rel="stylesheet" href="index.css">
-    <link rel="icon" type="image/x-icon" href="favicon.ico">
+    <link rel="icon" type="image/svg+xml" href="favicon.svg">
 </head>
 <body>
     <div id="root"></div>
@@ -73,7 +73,7 @@ const indexHtml = `<!DOCTYPE html>
 </body>
 </html>`;
 
-await fs.copyFile("src/client/favicon.ico", "dist/client/favicon.ico");
+await fs.copyFile("src/client/favicon.svg", "dist/client/favicon.svg");
 await fs.writeFile("dist/client/index.html", indexHtml);
 
 // tsc keeps the source's extensionless relative specifiers, which Node16/NodeNext consumers cannot resolve

@@ -52,7 +52,7 @@ const CLIENT_FILES: Record<string, string> = {
 	"index.html": "text/html; charset=utf-8",
 	"index.js": "text/javascript; charset=utf-8",
 	"index.css": "text/css; charset=utf-8",
-	"favicon.ico": "image/x-icon",
+	"favicon.svg": "image/svg+xml",
 };
 
 /**
