@@ -9,6 +9,7 @@ import {
 	formatStatsDashboardUrl,
 	getDashboardStats,
 	getTotalMessageCount,
+	hasStoredPrices,
 	initDb,
 	isLoopbackHost,
 	type ModelPrice,
@@ -86,11 +87,14 @@ function shortenSessionFile(p: string): string {
 }
 
 /**
- * Seed the rate card from pi-ai's built-in catalog when the host package can
- * be resolved (a global `npm i -g pi-stats` installs it as a peer). Without
- * it the bin prices with the snapshot the extension last stored.
+ * Seed an empty rate card from pi-ai's built-in catalog when the host package
+ * can be resolved (a global `npm i -g` installs it as a peer). A stored card
+ * is left alone: the extension's covers `models.json` and extension providers
+ * too, and replacing it would re-price their requests.
  */
 async function loadCatalogPrices(): Promise<void> {
+	await initDb();
+	if (hasStoredPrices()) return;
 	// Not a literal: the bundler must leave this host import to the runtime.
 	const specifier = "@earendil-works/pi-ai/providers/all";
 	let catalog: {
@@ -108,9 +112,7 @@ async function loadCatalogPrices(): Promise<void> {
 			if (model.cost) prices.push({ ...model.cost, provider: model.provider, model: model.id });
 		}
 	}
-	if (prices.length === 0) return;
-	await initDb();
-	setModelPrices(prices);
+	if (prices.length > 0) setModelPrices(prices);
 }
 
 async function main(): Promise<void> {

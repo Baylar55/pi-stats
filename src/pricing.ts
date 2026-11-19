@@ -2,10 +2,12 @@
  * The rate card behind every API-equivalent cost estimate.
  *
  * omp prices usage from its bundled model catalog; pi-stats has no catalog of
- * its own. The host hands over its prices through {@link setModelPrices} (the
- * extension from pi's model registry, the bin from pi-ai's catalog) and they
- * are persisted in `model_prices`, so every process sharing the database
- * prices identically. That table is the only rate card.
+ * its own. The extension hands over pi's model registry through
+ * {@link setModelPrices} and it is persisted in `model_prices`, so every
+ * process sharing the database prices identically. The bin seeds pi-ai's
+ * built-in catalog only into an empty table: it lacks `models.json` and
+ * extension providers, and must not overwrite the extension's fuller card.
+ * That table is the only rate card.
  *
  * Costs follow pi-ai's `calculateCost`: context tiers are selected by the
  * prompt size (`input + cacheRead + cacheWrite`) and 1-hour cache writes cost
@@ -95,6 +97,8 @@ const PRICE_COLUMNS = "provider, model, input, output, cache_read, cache_write, 
  * else the same model id under another provider that does. A subscription or
  * OAuth provider lists its models at zero; that peer is the public API price
  * of the same model. Peers are tried in provider order so the choice is stable.
+ * ponytail: when two providers list the same id at different prices (a reseller
+ * markup), the alphabetically first wins; omp uses an explicit peer table.
  */
 const FIND_PRICE_SQL = `
 	SELECT ${PRICE_COLUMNS} FROM model_prices
@@ -126,6 +130,11 @@ function samePrice(a: PriceRow | null, b: PriceRow | null): boolean {
 export function hasModelPrice(provider: string, model: string): boolean {
 	const database = currentDb();
 	return database !== null && findPriceRow(database, provider, model) !== null;
+}
+
+/** Whether any rate card is stored. False before `initDb`. */
+export function hasStoredPrices(): boolean {
+	return Boolean(currentDb()?.query("SELECT 1 FROM model_prices LIMIT 1").get());
 }
 
 /**

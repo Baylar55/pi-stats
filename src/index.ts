@@ -25,7 +25,7 @@ export { closeDb, initDb, type RequestTiming } from "./db";
 export type { JudgeCompletion, JudgePrompt } from "./judge";
 export { setStatsJudgeProvider, type StatsJudge, type StatsJudgeModel, type StatsJudgeProvider } from "./frustration";
 export { canOpenBrowser, openBrowser } from "./open";
-export { type ModelPrice, setModelPrices } from "./pricing";
+export { hasStoredPrices, type ModelPrice, setModelPrices } from "./pricing";
 export { refreshRollups } from "./rollup";
 export {
 	formatStatsDashboardUrl,
