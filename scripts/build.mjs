@@ -1,5 +1,9 @@
-// Builds dist/: the pi extension entry, the host-free runtime (library, bin, sync worker) and the React client.
+// Builds dist/: the pi extension entry, the host-free runtime (library, bin, sync worker), the React client
+// and the declarations of the programmatic API.
+import { execFileSync } from "node:child_process";
 import * as fs from "node:fs/promises";
+import { createRequire } from "node:module";
+import * as path from "node:path";
 import { build } from "esbuild";
 
 await fs.rm("dist", { recursive: true, force: true });
@@ -71,3 +75,14 @@ const indexHtml = `<!DOCTYPE html>
 
 await fs.copyFile("src/client/favicon.ico", "dist/client/favicon.ico");
 await fs.writeFile("dist/client/index.html", indexHtml);
+
+// tsc keeps the source's extensionless relative specifiers, which Node16/NodeNext consumers cannot resolve
+// in an ESM package: add the `.js` the emitted files sit beside.
+const tsc = path.join(path.dirname(createRequire(import.meta.url).resolve("typescript/package.json")), "bin", "tsc");
+execFileSync(process.execPath, [tsc, "-p", "tsconfig.types.json"], { stdio: "inherit" });
+for (const entry of await fs.readdir("dist/types", { recursive: true })) {
+	if (!entry.endsWith(".d.ts")) continue;
+	const file = path.join("dist/types", entry);
+	const source = await fs.readFile(file, "utf8");
+	await fs.writeFile(file, source.replace(/((?:from|import\()\s*")(\.\.?\/[^"]+?)(")/g, "$1$2.js$3"));
+}

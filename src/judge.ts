@@ -19,7 +19,8 @@ export interface JudgePrompt {
 	user: string;
 }
 
-export type FrustrationTarget = keyof typeof questionFile.target.criteria;
+/** The `target` options of the prompt file, spelled out so the emitted declarations import no JSON. */
+export type FrustrationTarget = "assistant" | "other" | "none";
 
 export interface FrustrationAnswer {
 	/** Level on the rubric's four-point scale (0 = neutral, 3 = angry). */
@@ -28,7 +29,9 @@ export interface FrustrationAnswer {
 }
 
 const LEVELS = questionFile.annoyed.criteria;
-const TARGETS = Object.keys(questionFile.target.criteria) as FrustrationTarget[];
+// Fails to compile when the prompt file loses one of the options above.
+const TARGET_CRITERIA: Record<FrustrationTarget, string> = questionFile.target.criteria;
+const TARGETS = Object.keys(TARGET_CRITERIA) as FrustrationTarget[];
 const QUESTION_IDS = ["annoyed", "target"] as const;
 /** Extra attempts when a reply does not parse (omp's chat backend `parseRetries`). */
 const PARSE_RETRIES = 2;
